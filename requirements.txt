@@ -1,0 +1,26 @@
+# Core Multi-Agent & AI SDKs
+pydantic>=2.10.0
+python-dotenv>=1.0.0
+google-genai>=1.0.0
+
+# Video Download & Speech Synthesis
+yt-dlp>=2024.0.0
+edge-tts>=6.1.0
+
+# Subtitle Generation & ML Runtimes
+faster-whisper>=1.0.0
+torch
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+
+# YouTube Data API v3 Auto-Upload & US Timezone Scheduling
+google-api-python-client>=2.140.0
+google-auth>=2.30.0
+google-auth-oauthlib>=1.2.0
+google-auth-httplib2>=0.2.0
+tzdata>=2024.1
+
+# Media & Utilities
+requests>=2.31.0
+numpy>=1.24.0
+pillow>=10.0.0

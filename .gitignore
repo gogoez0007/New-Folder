@@ -1,0 +1,17 @@
+# Secrets & OAuth Tokens (NEVER commit)
+.env
+credentials/
+*.secret*.json
+client_secret*.json
+youtube_token.json
+
+# Generated artifacts & caches
+workspace/
+output/
+__pycache__/
+*.py[cod]
+*.mp4
+*.mp3
+*.wav
+*.log
+*.pyc

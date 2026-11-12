@@ -1,0 +1,86 @@
+"""
+Auto-generated Object Core Module: `Sinking Ocean Liner` (`sinking_ship`).
+Synthesized autonomously by `MetaCoreSynthesizer` (zero hardcode!).
+"""
+
+from core.object_knowledge_core import OBJECT_KNOWLEDGE_BASE, ObjectAnatomySpec
+
+SPEC = ObjectAnatomySpec.model_validate({ 'object_id': 'sinking_ship',
+  'display_name': 'Sinking Ocean Liner',
+  'category': 'water_beach',
+  'builder_key': 'generated_builder',
+  'real_anatomy_parts': [ 'hull_body',
+                          'hull_bottom',
+                          'superstructure_deck1',
+                          'superstructure_deck2',
+                          'funnel_forward',
+                          'funnel_rear',
+                          'bridge'],
+  'typical_dimensions_m': [1.2, 0.8, 0.4],
+  'default_height_m': 0.8,
+  'surface_finish': 'painted_metal',
+  'motion_behavior': 'water_bob',
+  'placement_layer': 'ground',
+  'silhouette_notes': 'Tilted ocean liner vessel plunging bow-first into the '
+                      'dark water, showing multi-tiered superstructure and '
+                      'smoke stacks.',
+  'aliases': [ 'sinking_ship',
+               'sinking ship',
+               'titanic_prop',
+               'sinking_boat',
+               'ocean_liner'],
+  'composite_parts': [ { 'part_name': 'hull_body',
+                         'shape': 'box',
+                         'size': [1.2, 0.3, 0.35],
+                         'offset': [0.0, 0.15, 0.0],
+                         'rotation': [0.0, 0.0, -0.45],
+                         'color': '#1c2833',
+                         'finish': 'painted_metal'},
+                       { 'part_name': 'hull_bottom',
+                         'shape': 'box',
+                         'size': [1.1, 0.15, 0.33],
+                         'offset': [-0.05, 0.02, 0.0],
+                         'rotation': [0.0, 0.0, -0.45],
+                         'color': '#78281f',
+                         'finish': 'painted_metal'},
+                       { 'part_name': 'superstructure_deck1',
+                         'shape': 'box',
+                         'size': [0.7, 0.15, 0.28],
+                         'offset': [0.1, 0.35, 0.0],
+                         'rotation': [0.0, 0.0, -0.45],
+                         'color': '#f2f4f4',
+                         'finish': 'painted_metal'},
+                       { 'part_name': 'superstructure_deck2',
+                         'shape': 'box',
+                         'size': [0.4, 0.12, 0.22],
+                         'offset': [0.18, 0.48, 0.0],
+                         'rotation': [0.0, 0.0, -0.45],
+                         'color': '#f2f4f4',
+                         'finish': 'painted_metal'},
+                       { 'part_name': 'funnel_forward',
+                         'shape': 'cylinder',
+                         'size': [0.05, 0.3, 0.05],
+                         'offset': [0.05, 0.55, 0.0],
+                         'rotation': [0.0, 0.0, -0.45],
+                         'color': '#d35400',
+                         'finish': 'painted_metal'},
+                       { 'part_name': 'funnel_rear',
+                         'shape': 'cylinder',
+                         'size': [0.05, 0.28, 0.05],
+                         'offset': [0.22, 0.62, 0.0],
+                         'rotation': [0.0, 0.0, -0.45],
+                         'color': '#d35400',
+                         'finish': 'painted_metal'},
+                       { 'part_name': 'bridge',
+                         'shape': 'box',
+                         'size': [0.15, 0.1, 0.24],
+                         'offset': [0.35, 0.52, 0.0],
+                         'rotation': [0.0, 0.0, -0.45],
+                         'color': '#2c3e50',
+                         'finish': 'glass_facade'}]})
+
+
+def register() -> ObjectAnatomySpec:
+    """Register `sinking_ship` into the live Object Knowledge Base."""
+    OBJECT_KNOWLEDGE_BASE[SPEC.object_id] = SPEC
+    return SPEC

@@ -1,0 +1,86 @@
+"""
+Auto-generated Object Core Module: `Potted Cactus` (`cactus_pot`).
+Synthesized autonomously by `MetaCoreSynthesizer` (zero hardcode!).
+"""
+
+from core.object_knowledge_core import OBJECT_KNOWLEDGE_BASE, ObjectAnatomySpec
+
+SPEC = ObjectAnatomySpec.model_validate({ 'object_id': 'cactus_pot',
+  'display_name': 'Potted Cactus',
+  'category': 'nature_flora',
+  'builder_key': 'generated_builder',
+  'real_anatomy_parts': [ 'pot_base',
+                          'pot_rim',
+                          'soil',
+                          'main_stem',
+                          'stem_top',
+                          'left_arm',
+                          'right_arm'],
+  'typical_dimensions_m': [0.3, 0.45, 0.3],
+  'default_height_m': 0.45,
+  'surface_finish': 'ceramic',
+  'motion_behavior': 'static',
+  'placement_layer': 'ground',
+  'silhouette_notes': 'A rounded ceramic pot holding soil and a stylized '
+                      'central ribbed cactus stem with multiple small '
+                      'branching arms and tiny prickles.',
+  'aliases': [ 'cactus_pot',
+               'cactus pot',
+               'potted_plant',
+               'succulent_pot',
+               'desk_cactus'],
+  'composite_parts': [ { 'part_name': 'pot_base',
+                         'shape': 'cylinder',
+                         'size': [0.26, 0.22, 0.26],
+                         'offset': [0.0, 0.11, 0.0],
+                         'rotation': [0.0, 0.0, 0.0],
+                         'color': '#E06D53',
+                         'finish': 'ceramic'},
+                       { 'part_name': 'pot_rim',
+                         'shape': 'torus',
+                         'size': [0.14, 0.025, 0.025],
+                         'offset': [0.0, 0.21, 0.0],
+                         'rotation': [1.5708, 0.0, 0.0],
+                         'color': '#F0836B',
+                         'finish': 'ceramic'},
+                       { 'part_name': 'soil',
+                         'shape': 'cylinder',
+                         'size': [0.24, 0.04, 0.24],
+                         'offset': [0.0, 0.19, 0.0],
+                         'rotation': [0.0, 0.0, 0.0],
+                         'color': '#3B271A',
+                         'finish': 'matte_wood'},
+                       { 'part_name': 'main_stem',
+                         'shape': 'cylinder',
+                         'size': [0.1, 0.22, 0.1],
+                         'offset': [0.0, 0.3, 0.0],
+                         'rotation': [0.0, 0.0, 0.0],
+                         'color': '#438A5E',
+                         'finish': 'waxy_foliage'},
+                       { 'part_name': 'stem_top',
+                         'shape': 'sphere',
+                         'size': [0.1, 0.1, 0.1],
+                         'offset': [0.0, 0.41, 0.0],
+                         'rotation': [0.0, 0.0, 0.0],
+                         'color': '#438A5E',
+                         'finish': 'waxy_foliage'},
+                       { 'part_name': 'left_arm',
+                         'shape': 'capsule',
+                         'size': [0.05, 0.12, 0.05],
+                         'offset': [-0.08, 0.32, 0.0],
+                         'rotation': [0.0, 0.0, -0.7854],
+                         'color': '#3D7F54',
+                         'finish': 'waxy_foliage'},
+                       { 'part_name': 'right_arm',
+                         'shape': 'capsule',
+                         'size': [0.045, 0.1, 0.045],
+                         'offset': [0.07, 0.26, 0.0],
+                         'rotation': [0.0, 0.0, 0.7854],
+                         'color': '#3D7F54',
+                         'finish': 'waxy_foliage'}]})
+
+
+def register() -> ObjectAnatomySpec:
+    """Register `cactus_pot` into the live Object Knowledge Base."""
+    OBJECT_KNOWLEDGE_BASE[SPEC.object_id] = SPEC
+    return SPEC

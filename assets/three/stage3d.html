@@ -1,0 +1,2409 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <title>Three.js 3D GLB Multi-Phase Choreography Stage</title>
+  <style>
+    html,
+    body {
+      margin: 0;
+      padding: 0;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+      background: #000;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "/three.module.js"
+    }
+  }
+  </script>
+</head>
+
+<body>
+  <script type="module">
+    import * as THREE from 'three';
+    import { GLTFLoader } from '/GLTFLoader.js';
+    import * as SkeletonUtils from '/SkeletonUtils.js';
+    import { buildCumulusCloud, buildKnowledgeObject } from '/object_library.js';
+    import {
+      findBestHeadAndSpineBones,
+      attachExpressiveFaceRig,
+      updateExpressiveFaceRig,
+      applySafeHeadAndSpinePose,
+    } from '/face_rig.js';
+    import {
+      buildCinemaEnvironmentMap,
+      buildAtmosphereSkyDome,
+      createPBRGroundMaterial,
+      buildLivingBiomeDetails,
+      enhanceCharacterMaterialsAndContactShadow,
+      createCinemaComposer,
+    } from '/cinema_gpu.js';
+
+    let W = 1080, H = 1920;
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      preserveDrawingBuffer: true,
+      powerPreference: 'high-performance',
+    });
+    renderer.setSize(W, H, false);
+    renderer.setPixelRatio(1);
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.15;
+    document.body.appendChild(renderer.domElement);
+
+    // Composite 2D canvas for optional HUD overlays (e.g. HELP! + Like/Comment CTA in Scene 5)
+    const outCanvas = document.createElement('canvas');
+    outCanvas.width = W;
+    outCanvas.height = H;
+    const outCtx = outCanvas.getContext('2d');
+
+    const gltfLoader = new GLTFLoader();
+    const glbCache = new Map();
+
+    async function loadGLB(filename) {
+      if (!filename) return null;
+      if (glbCache.has(filename)) return glbCache.get(filename);
+      return new Promise((resolve) => {
+        gltfLoader.load(
+          '/models/' + filename,
+          (gltf) => { glbCache.set(filename, gltf); resolve(gltf); },
+          undefined,
+          () => { resolve(null); }
+        );
+      });
+    }
+
+    // Preload shared KayKit Rig_Medium animation packs (including grounded interaction, sit, lie, sneak & pickup)
+    let sharedKayKitClips = null;
+    const NON_CYCLIC_BLACKLIST = [
+      't-pose', 'spawn', 'death', 'hit_', 'skeletons_',
+      'jump_start', 'jump_land', 'jump_full', 'lie_down', 'lie_standup',
+      'sit_chair_down', 'sit_chair_standup', 'sit_floor_down', 'sit_floor_standup',
+      'experimental', 'awaken', 'resurrect', 'inactive',
+    ];
+
+    async function getSharedKayKitClips() {
+      if (sharedKayKitClips) return sharedKayKitClips;
+      const packFiles = [
+        'Rig_Medium_General.glb',
+        'Rig_Medium_MovementBasic.glb',
+        'Rig_Medium_Simulation.glb',
+      ];
+      const clips = [];
+      for (const pf of packFiles) {
+        const g = await loadGLB(pf);
+        if (g && g.animations) {
+          for (const anim of g.animations) {
+            const low = (anim.name || '').toLowerCase();
+            if (low && !NON_CYCLIC_BLACKLIST.some((bad) => low.includes(bad))) {
+              clips.push(anim);
+            }
+          }
+        }
+      }
+      sharedKayKitClips = clips;
+      return clips;
+    }
+
+    function findBestClip(clips, keywords, seed = 0) {
+      if (!clips || clips.length === 0) return null;
+      for (const kw of keywords) {
+        const matches = clips.filter((c) => {
+          const low = (c.name || '').toLowerCase();
+          if (!low.includes(kw)) return false;
+          // Guard standing idle/walk against matching jump_idle, lie_idle, sit_floor_idle, walkingback, walkjump
+          if (kw === 'idle' && (low.includes('jump') || low.includes('lie_') || low.includes('sit_') || low.includes('skeleton') || low.includes('headlow'))) {
+            return false;
+          }
+          if ((kw === 'walk' || kw === 'walking') && (low.includes('back') || low.includes('jump') || low.includes('skeleton'))) {
+            return false;
+          }
+          return true;
+        });
+        if (matches.length > 0) {
+          return matches[seed % matches.length];
+        }
+      }
+      const safeIdle = clips.find((c) => {
+        const low = (c.name || '').toLowerCase();
+        return low.includes('idle') || low.includes('survey');
+      });
+      return safeIdle || clips[0];
+    }
+
+    // Build a full multi-mode AnimationAction dictionary covering all 16 SceneCore AnimModeTypes
+    function buildCharacterActionsMap(mixer, clips, role, rigFamily = '', seed = 0) {
+      const map = {};
+      if (!clips || clips.length === 0) return map;
+
+      const isAnimal = (role === 'pet_animal' || role === 'wild_creature' || rigFamily === 'animal_quadruped' || rigFamily === 'dinosaur');
+      const isBird = (role === 'sky_bird' || rigFamily === 'sky_bird');
+
+      const modeKeywords = isBird
+        ? {
+          fly: ['fly', 'swim', 'run', 'walk', 'idle'],
+          run: ['fly', 'swim', 'run', 'walk', 'idle'],
+          walk: ['fly', 'swim', 'walk', 'idle'],
+          cheer: ['fly', 'idle'],
+          wave: ['fly', 'idle'],
+          idle: ['fly', 'idle'],
+        }
+        : isAnimal
+          ? {
+            run: ['gallop', 'run', 'walk', 'idle_2', 'survey', 'idle'],
+            walk: ['walk', 'gallop', 'run', 'idle', 'idle_2'],
+            sneak: ['walk', 'idle_headlow', 'idle_2', 'idle'],
+            pet_walk: ['walk', 'idle_2', 'idle'],
+            pet_run: ['gallop', 'run', 'walk'],
+            interact: ['idle_2', 'eating', 'idle', 'survey'],
+            pickup: ['eating', 'idle_2', 'idle'],
+            sit_floor: ['idle_headlow', 'idle_2', 'idle'],
+            sit_chair: ['idle_2', 'idle'],
+            lie_down: ['idle_headlow', 'idle_2_headlow', 'idle_2', 'idle'],
+            cheer: ['idle_2', 'idle', 'walk'],
+            dance: ['idle_2', 'walk', 'idle'],
+            wave: ['idle_2', 'idle', 'walk'],
+            jump: ['gallop_jump', 'jump', 'idle_2', 'idle'],
+            idle: ['idle', 'idle_2', 'survey'],
+          }
+          : {
+            run: ['running_a', 'running_b', 'run', 'walking_a'],
+            walk: ['walking_a', 'walking_b', 'walk', 'walking'],
+            sneak: ['walking_c', 'walking_b', 'walk_carry', 'walk', 'walking'],
+            interact: ['interact', 'use_item', 'punch', 'victory', 'idle'],
+            pickup: ['pickup', 'interact', 'use_item', 'idle'],
+            sit_floor: ['sit_floor_idle', 'sitting', 'sitdown', 'idle_a', 'idle'],
+            sit_chair: ['sit_chair_idle', 'sitting', 'sitdown', 'idle_a', 'idle'],
+            lie_down: ['lie_idle', 'defeat', 'death_a_pose', 'idle_a', 'idle'],
+            cheer: ['cheering', 'victory', 'thumbsup', 'dance', 'waving', 'idle'],
+            dance: ['samba', 'dance', 'cheering', 'victory', 'waving', 'idle'],
+            wave: ['waving', 'wave', 'yes', 'hello', 'victory', 'idle'],
+            jump: ['jump_idle', 'jump', 'cheering', 'victory'],
+            idle: ['idle_a', 'idle_2', 'idle'],
+          };
+
+      for (const [mode, kwList] of Object.entries(modeKeywords)) {
+        const clip = findBestClip(clips, kwList, seed);
+        if (clip) {
+          const act = mixer.clipAction(clip);
+          const cname = (clip.name || '').toLowerCase();
+          if (cname === 'sitdown' || cname === 'pickup' || cname === 'defeat') {
+            act.setLoop(THREE.LoopOnce, 1);
+            act.clampWhenFinished = true;
+          } else {
+            act.setLoop(THREE.LoopRepeat, Infinity);
+          }
+          map[mode] = act;
+        }
+      }
+      return map;
+    }
+
+    function lerpAngle(a, b, t) {
+      let diff = ((b - a + Math.PI) % (Math.PI * 2)) - Math.PI;
+      if (diff < -Math.PI) diff += Math.PI * 2;
+      return a + diff * t;
+    }
+
+    function normalizeAndWrapGLB(cloned, targetHeight, extraScale = 1.0) {
+      const wrapper = new THREE.Group();
+      const modelHolder = new THREE.Group();
+      modelHolder.add(cloned);
+      wrapper.add(modelHolder);
+
+      cloned.traverse((node) => {
+        if (/cigar|cigarette|tobacco|smoke_pipe|pipe_smoke/i.test(node.name || '')) {
+          node.visible = false;
+          node.scale.setScalar(0);
+          return;
+        }
+        if (node.isMesh) {
+          node.castShadow = true;
+          node.receiveShadow = true;
+          if (node.material) {
+            const mats = Array.isArray(node.material) ? node.material : [node.material];
+            for (const m of mats) {
+              if (/cigar|cigarette|tobacco/i.test(m.name || '')) {
+                node.visible = false;
+                return;
+              }
+              m.roughness = Math.min(0.85, Math.max(0.25, m.roughness ?? 0.55));
+              const mName = (m.name || '').toLowerCase();
+              if (mName === 'glass') {
+                m.transparent = true;
+                m.opacity = 0.25;
+                m.roughness = 0.1;
+                m.depthWrite = false;
+              } else if (mName === 'skin' || mName === 'face') {
+                m.color.set('#ffdbac');
+              }
+            }
+          }
+        }
+      });
+
+      wrapper.updateMatrixWorld(true);
+      const box = new THREE.Box3().setFromObject(cloned);
+      const sz = new THREE.Vector3();
+      box.getSize(sz);
+
+      const finalHeight = (targetHeight || 1.48) * (extraScale || 1.0);
+      if (sz.y > 0.001 && isFinite(sz.y)) {
+        const factor = finalHeight / sz.y;
+        modelHolder.scale.setScalar(factor);
+        wrapper.updateMatrixWorld(true);
+        const box2 = new THREE.Box3().setFromObject(modelHolder);
+        if (isFinite(box2.min.y)) {
+          modelHolder.position.y -= box2.min.y;
+        }
+      }
+      return { wrapper, modelHolder };
+    }
+
+    // Create a polka-dot / star patterned texture for inflatable pools + owner emblem badge (like reference_video.mp4)
+    function createPoolPatternTexture(baseHex, dotHex) {
+      const c = document.createElement('canvas');
+      c.width = 256;
+      c.height = 128;
+      const ctx = c.getContext('2d');
+      ctx.fillStyle = baseHex || '#00b4d8';
+      ctx.fillRect(0, 0, 256, 128);
+      ctx.fillStyle = dotHex || '#ffffff';
+      for (let y = 16; y < 128; y += 32) {
+        for (let x = 16; x < 256; x += 32) {
+          const ox = ((y / 32) % 2) * 16;
+          ctx.beginPath();
+          ctx.arc((x + ox) % 256, y, 4.5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+      const tex = new THREE.CanvasTexture(c);
+      tex.wrapS = THREE.RepeatWrapping;
+      tex.wrapT = THREE.RepeatWrapping;
+      tex.repeat.set(4, 1);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      return tex;
+    }
+
+    function createOwnerBadgeMesh(primaryHex, stationId) {
+      const c = document.createElement('canvas');
+      c.width = 512;
+      c.height = 512;
+      const ctx = c.getContext('2d');
+      ctx.scale(4, 4);
+
+      // Outer badge circle
+      ctx.beginPath();
+      ctx.arc(64, 64, 58, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffffff';
+      ctx.fill();
+      ctx.lineWidth = 8;
+      ctx.strokeStyle = primaryHex || '#00b4d8';
+      ctx.stroke();
+
+      // Cute stylized chibi face inside badge (matching station owner!)
+      const isHero = (stationId === 'station_hero');
+      // Hair/Hood
+      ctx.beginPath();
+      ctx.arc(64, 60, 42, Math.PI, 0, false);
+      ctx.fillStyle = isHero ? '#1e293b' : (primaryHex || '#0284c7');
+      ctx.fill();
+
+      // Face skin
+      ctx.beginPath();
+      ctx.arc(64, 68, 32, 0, Math.PI * 2);
+      ctx.fillStyle = '#ffedd5';
+      ctx.fill();
+
+      // Eyes
+      ctx.fillStyle = '#0f172a';
+      ctx.beginPath();
+      ctx.arc(51, 66, 5.5, 0, Math.PI * 2);
+      ctx.arc(77, 66, 5.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffffff';
+      ctx.beginPath();
+      ctx.arc(49, 64, 2.0, 0, Math.PI * 2);
+      ctx.arc(75, 64, 2.0, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Smile
+      ctx.strokeStyle = '#e11d48';
+      ctx.lineWidth = 3.5;
+      ctx.beginPath();
+      ctx.arc(64, 73, 10, 0.15 * Math.PI, 0.85 * Math.PI);
+      ctx.stroke();
+
+      if (isHero) {
+        // Cute yellow beak/crown accent on hood
+        ctx.fillStyle = '#facc15';
+        ctx.beginPath();
+        ctx.moveTo(64, 16);
+        ctx.lineTo(52, 34);
+        ctx.lineTo(76, 34);
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide });
+      const mesh = new THREE.Mesh(new THREE.CircleGeometry(0.24, 28), mat);
+      return mesh;
+    }
+
+    // Create 3D Overhead Comic Emote Bubble Sprite (`!`, `?`, `heart`, `broken_heart`, `star`, `help`, `music`)
+    const emoteTexCache = new Map();
+    function getEmoteTexture(emoteType) {
+      if (emoteTexCache.has(emoteType)) return emoteTexCache.get(emoteType);
+      const c = document.createElement('canvas');
+      c.width = 256;
+      c.height = 256;
+      const ctx = c.getContext('2d');
+
+      if (emoteType === 'help') {
+        // Iconic Jagged Yellow/Red Comic Burst "HELP!" (matches Reference Video Frame 10!)
+        ctx.save();
+        ctx.translate(128, 128);
+        const spikes = 14;
+        ctx.beginPath();
+        for (let i = 0; i < spikes * 2; i++) {
+          const r = (i % 2 === 0) ? 118 : 78;
+          const ang = (i * Math.PI) / spikes;
+          const x = Math.cos(ang) * r;
+          const y = Math.sin(ang) * r * 0.78;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+        ctx.fillStyle = '#facc15';
+        ctx.fill();
+        ctx.lineWidth = 8;
+        ctx.strokeStyle = '#0f172a';
+        ctx.stroke();
+
+        ctx.font = '900 58px Impact, Arial Black, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.lineWidth = 10;
+        ctx.strokeStyle = '#0f172a';
+        ctx.strokeText('HELP!', 0, 4);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('HELP!', 0, 4);
+        ctx.restore();
+      } else {
+        // Rounded comic speech bubble
+        ctx.beginPath();
+        ctx.arc(128, 110, 78, 0, Math.PI * 2);
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        ctx.lineWidth = 8;
+        ctx.strokeStyle = '#0f172a';
+        ctx.stroke();
+
+        // Pointer tail
+        ctx.beginPath();
+        ctx.moveTo(108, 180);
+        ctx.lineTo(128, 222);
+        ctx.lineTo(148, 180);
+        ctx.closePath();
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        if (emoteType === '!') {
+          ctx.font = '900 105px Impact, Arial Black, sans-serif';
+          ctx.fillStyle = '#ef4444';
+          ctx.fillText('!', 128, 114);
+        } else if (emoteType === '?') {
+          ctx.font = '900 98px Impact, Arial Black, sans-serif';
+          ctx.fillStyle = '#3b82f6';
+          ctx.fillText('?', 128, 114);
+        } else if (emoteType === 'broken_heart') {
+          ctx.font = '86px Segoe UI Emoji, Arial';
+          ctx.fillText('💔', 128, 116);
+        } else if (emoteType === 'heart') {
+          ctx.font = '86px Segoe UI Emoji, Arial';
+          ctx.fillText('❤️', 128, 116);
+        } else if (emoteType === 'star') {
+          ctx.font = '86px Segoe UI Emoji, Arial';
+          ctx.fillText('⭐', 128, 116);
+        } else if (emoteType === 'music') {
+          ctx.font = '86px Segoe UI Emoji, Arial';
+          ctx.fillText('🎵', 128, 116);
+        }
+      }
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      emoteTexCache.set(emoteType, tex);
+      return tex;
+    }
+
+    // Build 3D Environment Prop (using Extensible Real-Object Knowledge Library first!)
+    async function buildEnvironmentProp(propSpec, objectKnowledge, waterMeshes, breezeMeshes, movingCarList, plazaRings, dynamicLiftChairs, flyingAirplanes) {
+      if (!propSpec.glb_model) {
+        const recipe = (objectKnowledge && objectKnowledge[propSpec.prop_type]) || null;
+        const kObj = buildKnowledgeObject(propSpec, recipe, {
+          waterMeshes,
+          breezeMeshes,
+          movingCarList,
+          plazaRings,
+          dynamicLiftChairs,
+          flyingAirplanes,
+        });
+        if (kObj) {
+          return kObj;
+        }
+      }
+
+      const g = new THREE.Group();
+      g.position.set(propSpec.position[0], propSpec.position[1], propSpec.position[2]);
+      g.rotation.y = propSpec.rotation_y || 0;
+
+      if (propSpec.glb_model) {
+        const gltf = await loadGLB(propSpec.glb_model);
+        if (gltf && gltf.scene) {
+          const cloned = SkeletonUtils.clone(gltf.scene);
+          const { wrapper } = normalizeAndWrapGLB(cloned, propSpec.target_height_m || 2.5, propSpec.scale || 1.0);
+          g.add(wrapper);
+          if (propSpec.prop_type === 'palm_tree' || propSpec.prop_type === 'oak_tree' || propSpec.prop_type === 'pine_tree') {
+            breezeMeshes.push(g);
+          } else if (propSpec.prop_type === 'water_boat') {
+            waterMeshes.push(g);
+          } else if (propSpec.prop_type === 'moving_car') {
+            movingCarList.push(g);
+          }
+          return g;
+        }
+      }
+
+      g.scale.setScalar(propSpec.scale || 1.0);
+      const pMat = new THREE.MeshPhysicalMaterial({ color: propSpec.primary_color, roughness: 0.25, clearcoat: 0.6 });
+      const sMat = new THREE.MeshPhysicalMaterial({ color: propSpec.secondary_color, roughness: 0.35 });
+
+      if (propSpec.prop_type === 'inflatable_pool') {
+        const patTex = createPoolPatternTexture(propSpec.primary_color, propSpec.secondary_color);
+        const ringMat = new THREE.MeshPhysicalMaterial({ map: patTex, roughness: 0.22, clearcoat: 0.65 });
+        for (let r = 0; r < 3; r++) {
+          const ring = new THREE.Mesh(new THREE.TorusGeometry(0.88, 0.105, 18, 40), ringMat);
+          ring.rotation.x = Math.PI / 2;
+          ring.position.y = 0.105 + r * 0.165;
+          ring.castShadow = true;
+          ring.receiveShadow = true;
+          g.add(ring);
+        }
+        const isHeroPool = (propSpec.station_id === 'station_hero');
+        const waterMat = new THREE.MeshPhysicalMaterial({
+          color: isHeroPool ? '#64748b' : '#38bdf8',
+          roughness: 0.08,
+          transmission: 0.35,
+          transparent: true,
+          opacity: 0.88,
+          clearcoat: 1.0,
+        });
+        const waterDisk = new THREE.Mesh(new THREE.CylinderGeometry(0.82, 0.82, 0.38, 36), waterMat);
+        waterDisk.position.y = 0.20;
+        waterDisk.receiveShadow = true;
+        g.add(waterDisk);
+        waterMeshes.push(waterDisk);
+
+        // Owner face badge on the front wall of the pool (mirrors reference_video.mp4!)
+        const badge = createOwnerBadgeMesh(propSpec.primary_color, propSpec.station_id);
+        badge.position.set(0, 0.28, 0.99);
+        g.add(badge);
+
+      } else if (propSpec.prop_type === 'water_slide') {
+        const chute = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.16, 2.6), pMat);
+        chute.position.set(0, 1.1, 0.5);
+        chute.rotation.x = 0.52;
+        chute.castShadow = true;
+        const tower = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.65, 2.2, 20), sMat);
+        tower.position.set(0, 1.1, -0.5);
+        tower.castShadow = true;
+        const roof = new THREE.Mesh(new THREE.ConeGeometry(0.85, 0.7, 20), pMat);
+        roof.position.set(0, 2.5, -0.5);
+        g.add(chute, tower, roof);
+
+      } else if (propSpec.prop_type === 'ground_plaza_ring') {
+        const outerDisk = new THREE.Mesh(new THREE.CylinderGeometry(0.82, 0.85, 0.012, 36), pMat);
+        outerDisk.position.y = 0.006;
+        outerDisk.receiveShadow = true;
+        const innerDisk = new THREE.Mesh(new THREE.CylinderGeometry(0.66, 0.66, 0.014, 36), sMat);
+        innerDisk.position.y = 0.008;
+        innerDisk.receiveShadow = true;
+        const trimRing = new THREE.Mesh(
+          new THREE.RingGeometry(0.50, 0.58, 6),
+          new THREE.MeshBasicMaterial({ color: propSpec.primary_color, side: THREE.DoubleSide })
+        );
+        trimRing.rotation.x = -Math.PI / 2;
+        trimRing.position.y = 0.018;
+        g.add(outerDisk, innerDisk, trimRing);
+        plazaRings.push(trimRing);
+
+      } else if (propSpec.prop_type === 'beach_umbrella' || propSpec.prop_type === 'carousel_tent') {
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.06, 1.8, 12), sMat);
+        pole.position.y = 0.9;
+        const canopy = new THREE.Mesh(new THREE.ConeGeometry(1.1, 0.55, 20), pMat);
+        canopy.position.y = 1.85;
+        canopy.castShadow = true;
+        g.add(pole, canopy);
+        breezeMeshes.push(g);
+
+      } else if (propSpec.prop_type === 'balloon_bunch') {
+        const colors = ['#ff007f', '#00f5d4', '#ffbe0b', '#8338ec'];
+        for (let b = 0; b < 4; b++) {
+          const bal = new THREE.Mesh(
+            new THREE.SphereGeometry(0.16, 16, 16),
+            new THREE.MeshPhysicalMaterial({ color: colors[b], roughness: 0.1, clearcoat: 0.9 })
+          );
+          bal.position.set((b - 1.5) * 0.14, 1.55 + (b % 2) * 0.16, 0);
+          bal.castShadow = true;
+          g.add(bal);
+        }
+        breezeMeshes.push(g);
+
+      } else if (propSpec.prop_type === 'cage_trap') {
+        const baseMat = new THREE.MeshStandardMaterial({ color: '#334155', roughness: 0.45, metalness: 0.4 });
+        const barMat = new THREE.MeshStandardMaterial({ color: '#cbd5e1', roughness: 0.25, metalness: 0.85 });
+        const floorPlate = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.08, 1.15), baseMat);
+        floorPlate.position.y = 0.04;
+        floorPlate.receiveShadow = true;
+        const roofPlate = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.08, 1.15), baseMat);
+        roofPlate.position.y = 1.48;
+        roofPlate.castShadow = true;
+        g.add(floorPlate, roofPlate);
+        for (let ix = -2; ix <= 2; ix++) {
+          const bx = ix * 0.25;
+          for (const bz of [-0.52, 0.52]) {
+            const bar = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 1.42, 10), barMat);
+            bar.position.set(bx, 0.76, bz);
+            bar.castShadow = true;
+            g.add(bar);
+          }
+          if (ix === -2 || ix === 2) {
+            for (const bz of [-0.26, 0.0, 0.26]) {
+              const sbar = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 1.42, 10), barMat);
+              sbar.position.set(bx, 0.76, bz);
+              sbar.castShadow = true;
+              g.add(sbar);
+            }
+          }
+        }
+        const lockBody = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.20, 0.08), new THREE.MeshStandardMaterial({ color: '#facc15', metalness: 0.5, roughness: 0.25 }));
+        lockBody.position.set(0, 0.72, 0.56);
+        g.add(lockBody);
+
+      } else if (propSpec.prop_type === 'mystery_table') {
+        const clothMat = new THREE.MeshStandardMaterial({ color: '#dc2626', roughness: 0.55 });
+        const woodMat = new THREE.MeshStandardMaterial({ color: '#78350f', roughness: 0.7 });
+        const silverMat = new THREE.MeshStandardMaterial({ color: '#e2e8f0', metalness: 0.85, roughness: 0.15 });
+        const tableTop = new THREE.Mesh(new THREE.BoxGeometry(1.55, 0.12, 0.85), clothMat);
+        tableTop.position.y = 0.78;
+        tableTop.castShadow = true;
+        g.add(tableTop);
+        for (const [lx, lz] of [[-0.65, -0.32], [0.65, -0.32], [-0.65, 0.32], [0.65, 0.32]]) {
+          const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.76, 12), woodMat);
+          leg.position.set(lx, 0.38, lz);
+          leg.castShadow = true;
+          g.add(leg);
+        }
+        for (const cx of [-0.46, 0.0, 0.46]) {
+          const tray = new THREE.Mesh(new THREE.CylinderGeometry(0.20, 0.20, 0.025, 24), silverMat);
+          tray.position.set(cx, 0.855, 0);
+          const dome = new THREE.Mesh(new THREE.SphereGeometry(0.18, 24, 14, 0, Math.PI * 2, 0, Math.PI * 0.5), silverMat);
+          dome.position.set(cx, 0.865, 0);
+          dome.castShadow = true;
+          const knob = new THREE.Mesh(new THREE.SphereGeometry(0.032, 12, 12), new THREE.MeshStandardMaterial({ color: '#facc15', metalness: 0.7 }));
+          knob.position.set(cx, 1.055, 0);
+          g.add(tray, dome, knob);
+        }
+
+      } else if (propSpec.prop_type === 'race_finish_arch') {
+        const postMat = new THREE.MeshStandardMaterial({ color: '#ef4444', roughness: 0.35 });
+        const bannerMat = new THREE.MeshStandardMaterial({ color: '#1e293b', roughness: 0.35 });
+        const whiteMat = new THREE.MeshStandardMaterial({ color: '#f8fafc', roughness: 0.35 });
+        for (const px of [-1.25, 1.25]) {
+          const post = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.09, 2.25, 16), postMat);
+          post.position.set(px, 1.12, 0);
+          post.castShadow = true;
+          const cone = new THREE.Mesh(new THREE.ConeGeometry(0.16, 0.35, 16), new THREE.MeshStandardMaterial({ color: '#f97316' }));
+          cone.position.set(px * 1.18, 0.175, 0.18);
+          g.add(post, cone);
+        }
+        const bar = new THREE.Mesh(new THREE.BoxGeometry(2.75, 0.38, 0.14), bannerMat);
+        bar.position.set(0, 2.18, 0);
+        bar.castShadow = true;
+        g.add(bar);
+        for (let k = -5; k <= 5; k++) {
+          if (k % 2 === 0) {
+            const sq = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.32, 0.16), whiteMat);
+            sq.position.set(k * 0.23, 2.18, 0);
+            g.add(sq);
+          }
+        }
+
+      } else if (propSpec.prop_type === 'treasure_chest') {
+        const chestWood = new THREE.MeshStandardMaterial({ color: '#92400e', roughness: 0.65 });
+        const goldMat = new THREE.MeshStandardMaterial({ color: '#facc15', metalness: 0.8, roughness: 0.2 });
+        const body = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.45, 0.62), chestWood);
+        body.position.y = 0.225;
+        body.castShadow = true;
+        const lid = new THREE.Mesh(new THREE.CylinderGeometry(0.31, 0.31, 0.95, 16, 1, false, 0, Math.PI), chestWood);
+        lid.rotation.z = Math.PI / 2;
+        lid.rotation.x = Math.PI / 2;
+        lid.position.y = 0.45;
+        lid.castShadow = true;
+        const latch = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.18, 0.08), goldMat);
+        latch.position.set(0, 0.42, 0.32);
+        g.add(body, lid, latch);
+
+      } else if (propSpec.prop_type === 'park_bench') {
+        const plankMat = new THREE.MeshStandardMaterial({ color: '#b45309', roughness: 0.65 });
+        const ironMat = new THREE.MeshStandardMaterial({ color: '#1e293b', metalness: 0.6, roughness: 0.4 });
+        const seat = new THREE.Mesh(new THREE.BoxGeometry(1.55, 0.08, 0.48), plankMat);
+        seat.position.set(0, 0.42, 0);
+        seat.castShadow = true;
+        const back = new THREE.Mesh(new THREE.BoxGeometry(1.55, 0.42, 0.08), plankMat);
+        back.position.set(0, 0.72, -0.20);
+        back.rotation.x = -0.14;
+        back.castShadow = true;
+        g.add(seat, back);
+        for (const lx of [-0.66, 0.66]) {
+          const legF = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.42, 0.42), ironMat);
+          legF.position.set(lx, 0.21, 0);
+          g.add(legF);
+        }
+
+      } else if (propSpec.prop_type === 'magic_portal') {
+        const stoneMat = new THREE.MeshStandardMaterial({ color: '#475569', roughness: 0.7 });
+        const glowMat = new THREE.MeshBasicMaterial({ color: '#a855f7', transparent: true, opacity: 0.65, side: THREE.DoubleSide });
+        const plinth = new THREE.Mesh(new THREE.CylinderGeometry(0.95, 1.15, 0.18, 24), stoneMat);
+        plinth.position.y = 0.09;
+        const arch = new THREE.Mesh(new THREE.TorusGeometry(0.92, 0.14, 16, 36), new THREE.MeshStandardMaterial({ color: '#6366f1', metalness: 0.4, roughness: 0.2 }));
+        arch.position.y = 1.12;
+        arch.castShadow = true;
+        const swirl = new THREE.Mesh(new THREE.CircleGeometry(0.84, 32), glowMat);
+        swirl.position.y = 1.12;
+        g.add(plinth, arch, swirl);
+        plazaRings.push(swirl);
+
+      } else if (propSpec.prop_type === 'control_pedestal') {
+        const pedMat = new THREE.MeshStandardMaterial({ color: '#334155', metalness: 0.4, roughness: 0.35 });
+        const col = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.28, 0.88, 16), pedMat);
+        col.position.y = 0.44;
+        col.castShadow = true;
+        const panel = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.10, 0.44), pedMat);
+        panel.position.set(0, 0.90, 0);
+        panel.rotation.x = 0.25;
+        const btnRed = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.07, 16), new THREE.MeshStandardMaterial({ color: '#ef4444', emissive: '#991b1b' }));
+        btnRed.position.set(-0.14, 0.96, 0.02);
+        const btnGreen = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.07, 16), new THREE.MeshStandardMaterial({ color: '#22c55e', emissive: '#166534' }));
+        btnGreen.position.set(0.14, 0.96, 0.02);
+        g.add(col, panel, btnRed, btnGreen);
+
+      } else if (propSpec.prop_type === 'gift_box_pile') {
+        const boxSpecs = [
+          { pos: [0, 0.24, 0], size: [0.56, 0.48, 0.56], col: '#ec4899', rib: '#fde047' },
+          { pos: [0.38, 0.18, 0.22], size: [0.38, 0.36, 0.38], col: '#38bdf8', rib: '#ffffff' },
+          { pos: [0.02, 0.62, -0.02], size: [0.34, 0.30, 0.34], col: '#a855f7', rib: '#facc15' },
+        ];
+        for (const bx of boxSpecs) {
+          const m = new THREE.Mesh(new THREE.BoxGeometry(...bx.size), new THREE.MeshStandardMaterial({ color: bx.col, roughness: 0.3 }));
+          m.position.set(...bx.pos);
+          m.castShadow = true;
+          const r1 = new THREE.Mesh(new THREE.BoxGeometry(bx.size[0] + 0.02, bx.size[1] + 0.02, 0.06), new THREE.MeshStandardMaterial({ color: bx.rib }));
+          r1.position.set(...bx.pos);
+          g.add(m, r1);
+        }
+
+      } else if (propSpec.prop_type === 'obstacle_hurdle') {
+        const frameMat = new THREE.MeshStandardMaterial({ color: '#eab308', roughness: 0.35 });
+        for (const hx of [-0.55, 0.55]) {
+          const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.04, 0.62, 12), frameMat);
+          leg.position.set(hx, 0.31, 0);
+          leg.castShadow = true;
+          g.add(leg);
+        }
+        const cross = new THREE.Mesh(new THREE.BoxGeometry(1.25, 0.14, 0.06), new THREE.MeshStandardMaterial({ color: '#ef4444' }));
+        cross.position.set(0, 0.58, 0);
+        cross.castShadow = true;
+        g.add(cross);
+
+      } else if (propSpec.prop_type === 'campfire_ring') {
+        const stoneMat = new THREE.MeshStandardMaterial({ color: '#64748b', roughness: 0.85 });
+        for (let s = 0; s < 8; s++) {
+          const a = (s / 8) * Math.PI * 2;
+          const st = new THREE.Mesh(new THREE.DodecahedronGeometry(0.11, 0), stoneMat);
+          st.position.set(Math.cos(a) * 0.42, 0.08, Math.sin(a) * 0.42);
+          g.add(st);
+        }
+        const flame1 = new THREE.Mesh(new THREE.ConeGeometry(0.18, 0.48, 12), new THREE.MeshBasicMaterial({ color: '#f97316' }));
+        flame1.position.y = 0.24;
+        const flame2 = new THREE.Mesh(new THREE.ConeGeometry(0.10, 0.34, 12), new THREE.MeshBasicMaterial({ color: '#facc15' }));
+        flame2.position.y = 0.20;
+        g.add(flame1, flame2);
+
+      } else if (propSpec.prop_type === 'stage_podium') {
+        const tiers = [
+          { pos: [0, 0.28, 0], size: [0.75, 0.56, 0.65], col: '#facc15' },
+          { pos: [-0.75, 0.18, 0], size: [0.68, 0.36, 0.60], col: '#cbd5e1' },
+          { pos: [0.75, 0.14, 0], size: [0.68, 0.28, 0.60], col: '#d97706' },
+        ];
+        for (const t of tiers) {
+          const blk = new THREE.Mesh(new THREE.BoxGeometry(...t.size), new THREE.MeshStandardMaterial({ color: t.col, roughness: 0.3 }));
+          blk.position.set(...t.pos);
+          blk.castShadow = true;
+          blk.receiveShadow = true;
+          g.add(blk);
+        }
+
+      } else if (propSpec.prop_type === 'bridge_span') {
+        const deckMat = new THREE.MeshStandardMaterial({ color: '#fbbf24', roughness: 0.35 });
+        const brickMat = new THREE.MeshStandardMaterial({ color: '#d97706', roughness: 0.5 });
+        const deck = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.22, 0.95), deckMat);
+        deck.position.y = 0.28;
+        deck.castShadow = true;
+        deck.receiveShadow = true;
+        g.add(deck);
+        for (const sx of [-1.05, -0.35, 0.35, 1.05]) {
+          const pier = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.28, 0.85), brickMat);
+          pier.position.set(sx, 0.14, 0);
+          pier.castShadow = true;
+          g.add(pier);
+        }
+        for (const rz of [-0.44, 0.44]) {
+          const rail = new THREE.Mesh(new THREE.BoxGeometry(2.6, 0.12, 0.08), brickMat);
+          rail.position.set(0, 0.45, rz);
+          g.add(rail);
+        }
+
+      } else if (propSpec.prop_type === 'book_and_coin_stacks') {
+        const bookColors = ['#2563eb', '#ef4444', '#10b981', '#8b5cf6'];
+        for (let b = 0; b < 4; b++) {
+          const bk = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.16, 0.54), new THREE.MeshStandardMaterial({ color: bookColors[b], roughness: 0.35 }));
+          bk.position.set(0.85, 0.08 + b * 0.16, 0);
+          bk.rotation.y = (b % 2 === 0 ? 0.08 : -0.06);
+          bk.castShadow = true;
+          g.add(bk);
+        }
+        const greenBill = new THREE.MeshStandardMaterial({ color: '#22c55e', roughness: 0.4 });
+        const goldMat = new THREE.MeshStandardMaterial({ color: '#facc15', metalness: 0.75, roughness: 0.25 });
+        for (let m = 0; m < 4; m++) {
+          const bundle = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.15, 0.42), greenBill);
+          bundle.position.set(-0.85, 0.075 + m * 0.15, 0);
+          bundle.castShadow = true;
+          const band = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.155, 0.44), goldMat);
+          band.position.set(-0.85, 0.075 + m * 0.15, 0);
+          g.add(bundle, band);
+        }
+
+      } else if (propSpec.prop_type === 'color_archways') {
+        const archWallMat = new THREE.MeshStandardMaterial({ color: '#facc15', roughness: 0.3 });
+        const doorColors = ['#ef4444', '#a855f7', '#06b6d4'];
+        for (let k = -1; k <= 1; k++) {
+          const cx = k * 1.45;
+          const pillarL = new THREE.Mesh(new THREE.BoxGeometry(0.28, 1.15, 0.65), archWallMat);
+          pillarL.position.set(cx - 0.48, 0.575, 0);
+          pillarL.castShadow = true;
+          const pillarR = new THREE.Mesh(new THREE.BoxGeometry(0.28, 1.15, 0.65), archWallMat);
+          pillarR.position.set(cx + 0.48, 0.575, 0);
+          pillarR.castShadow = true;
+          const topBeam = new THREE.Mesh(new THREE.BoxGeometry(1.42, 0.34, 0.68), archWallMat);
+          topBeam.position.set(cx, 1.25, 0);
+          topBeam.castShadow = true;
+          const portal = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.28, 0.28, 0.78, 16),
+            new THREE.MeshStandardMaterial({ color: doorColors[k + 1], roughness: 0.25 })
+          );
+          portal.position.set(cx, 0.39, -0.05);
+          portal.castShadow = true;
+          g.add(pillarL, pillarR, topBeam, portal);
+        }
+
+      } else if (propSpec.prop_type === 'color_cubes') {
+        const cubeSpecs = [
+          { pos: [-0.95, 0.26, 0.25], col: '#ef4444', s: 0.52 },
+          { pos: [-0.25, 0.28, -0.25], col: '#3b82f6', s: 0.56 },
+          { pos: [0.45, 0.26, 0.25], col: '#a855f7', s: 0.52 },
+          { pos: [1.05, 0.26, -0.20], col: '#06b6d4', s: 0.50 },
+        ];
+        for (const cb of cubeSpecs) {
+          const box = new THREE.Mesh(
+            new THREE.BoxGeometry(cb.s, cb.s, cb.s),
+            new THREE.MeshPhysicalMaterial({ color: cb.col, roughness: 0.2, clearcoat: 0.6 })
+          );
+          box.position.set(...cb.pos);
+          box.castShadow = true;
+          box.receiveShadow = true;
+          g.add(box);
+        }
+        const heartGem = new THREE.Mesh(
+          new THREE.OctahedronGeometry(0.18, 0),
+          new THREE.MeshPhysicalMaterial({ color: '#f43f5e', emissive: '#9f1239', roughness: 0.15, clearcoat: 0.9 })
+        );
+        heartGem.position.set(0.0, 0.35, 0.55);
+        g.add(heartGem);
+        breezeMeshes.push(heartGem);
+
+      } else if (propSpec.prop_type === 'trophy_display') {
+        const ped = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.38, 0.62, 16), new THREE.MeshStandardMaterial({ color: '#e2e8f0', roughness: 0.3 }));
+        ped.position.y = 0.31;
+        ped.castShadow = true;
+        const gold = new THREE.MeshStandardMaterial({ color: '#facc15', metalness: 0.85, roughness: 0.15 });
+        const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.12, 0.28, 16), gold);
+        stem.position.y = 0.76;
+        const cup = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.14, 0.38, 20), gold);
+        cup.position.y = 1.05;
+        cup.castShadow = true;
+        g.add(ped, stem, cup);
+
+      } else if (propSpec.prop_type === 'skyscraper_city') {
+        // Cluster of tall shimmering golden & glass skyscrapers framing the golden city skyline!
+        const towers = [
+          { pos: [-5.2, 0.0, -3.5], w: 2.4, h: 14.0, d: 2.4, col: '#facc15', win: '#fef9c3' },
+          { pos: [5.2, 0.0, -3.2], w: 2.5, h: 16.5, d: 2.4, col: '#eab308', win: '#fef08a' },
+          { pos: [-2.8, 0.0, -7.2], w: 2.8, h: 20.0, d: 2.6, col: '#fbbf24', win: '#e0f2fe' },
+          { pos: [2.9, 0.0, -7.0], w: 2.8, h: 18.5, d: 2.6, col: '#f59e0b', win: '#fef08a' },
+          { pos: [0.0, 0.0, -9.8], w: 3.4, h: 23.0, d: 3.0, col: '#eab308', win: '#fffbeb' },
+          { pos: [-6.8, 0.0, -7.8], w: 2.6, h: 15.0, d: 2.4, col: '#ca8a04', win: '#fef08a' },
+          { pos: [6.8, 0.0, -8.2], w: 2.6, h: 17.5, d: 2.4, col: '#d97706', win: '#e0f2fe' },
+        ];
+        for (const tw of towers) {
+          const c = document.createElement('canvas');
+          c.width = 128; c.height = 256;
+          const ctx = c.getContext('2d');
+          ctx.fillStyle = tw.col;
+          ctx.fillRect(0, 0, 128, 256);
+          ctx.fillStyle = tw.win;
+          for (let ry = 10; ry < 246; ry += 18) {
+            for (let cx = 10; cx < 118; cx += 22) {
+              ctx.fillRect(cx, ry, 14, 11);
+            }
+          }
+          const wTex = new THREE.CanvasTexture(c);
+          wTex.colorSpace = THREE.SRGBColorSpace;
+          const mesh = new THREE.Mesh(
+            new THREE.BoxGeometry(tw.w, tw.h, tw.d),
+            new THREE.MeshStandardMaterial({ map: wTex, metalness: 0.35, roughness: 0.25 })
+          );
+          mesh.position.set(tw.pos[0], tw.h * 0.5, tw.pos[2]);
+          mesh.castShadow = true;
+          mesh.receiveShadow = true;
+          g.add(mesh);
+        }
+
+      } else if (propSpec.prop_type === 'hydraulic_lift_chair') {
+        const baseMat = new THREE.MeshStandardMaterial({ color: '#475569', metalness: 0.75, roughness: 0.25 });
+        const chromeMat = new THREE.MeshStandardMaterial({ color: '#e2e8f0', metalness: 0.9, roughness: 0.15 });
+        const chairMat = new THREE.MeshStandardMaterial({ color: '#78350f', roughness: 0.5 });
+        const plate = new THREE.Mesh(new THREE.BoxGeometry(0.92, 0.08, 0.92), baseMat);
+        plate.position.y = 0.04;
+        plate.receiveShadow = true;
+        const pedal = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.05, 0.14), chromeMat);
+        pedal.position.set(-0.42, 0.10, 0.0);
+        pedal.rotation.z = 0.14;
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.065, 0.075, 1.0, 16), chromeMat);
+        pole.position.y = 0.5;
+        pole.castShadow = true;
+
+        const seatGroup = new THREE.Group();
+        const cushion = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.16, 0.58), chairMat);
+        cushion.position.y = -0.02;
+        cushion.castShadow = true;
+        const backRest = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.58, 0.14), chairMat);
+        backRest.position.set(0, 0.28, -0.24);
+        backRest.castShadow = true;
+        const armL = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.24, 0.52), chairMat);
+        armL.position.set(-0.28, 0.12, 0);
+        const armR = armL.clone();
+        armR.position.x = 0.28;
+        seatGroup.add(cushion, backRest, armL, armR);
+        g.add(plate, pedal, pole, seatGroup);
+        if (dynamicLiftChairs) {
+          dynamicLiftChairs.push({ group: g, pole, seatGroup, pedal });
+        }
+
+      } else if (propSpec.prop_type === 'flying_airplane') {
+        const jetWhite = new THREE.MeshStandardMaterial({ color: '#f8fafc', roughness: 0.22, metalness: 0.25 });
+        const jetBlue = new THREE.MeshStandardMaterial({ color: '#0284c7', roughness: 0.28 });
+        const glassMat = new THREE.MeshStandardMaterial({ color: '#0f172a', roughness: 0.1, metalness: 0.8 });
+        const fus = new THREE.Mesh(new THREE.CylinderGeometry(0.36, 0.30, 3.2, 18), jetWhite);
+        fus.rotation.z = Math.PI / 2;
+        const nose = new THREE.Mesh(new THREE.SphereGeometry(0.36, 16, 16), jetBlue);
+        nose.position.x = 1.55;
+        const cockpit = new THREE.Mesh(new THREE.BoxGeometry(0.45, 0.16, 0.32), glassMat);
+        cockpit.position.set(1.22, 0.24, 0);
+        const wing = new THREE.Mesh(new THREE.BoxGeometry(0.75, 0.08, 3.4), jetBlue);
+        wing.position.set(0.15, -0.04, 0);
+        const tail = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.72, 0.08), jetBlue);
+        tail.position.set(-1.35, 0.40, 0);
+        g.scale.setScalar(1.35);
+        g.add(fus, nose, cockpit, wing, tail);
+        if (flyingAirplanes) {
+          flyingAirplanes.push(g);
+        }
+
+      } else if (propSpec.prop_type === 'hollow_tree_trunk') {
+        const barkMat = new THREE.MeshStandardMaterial({ color: '#78350f', roughness: 0.85 });
+        const rimMat = new THREE.MeshStandardMaterial({ color: '#92400e', roughness: 0.75 });
+        const darkHoleMat = new THREE.MeshBasicMaterial({ color: '#0f172a' });
+        const leafMat = new THREE.MeshStandardMaterial({ color: '#22c55e', roughness: 0.6 });
+        const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.78, 1.08, 3.4, 16), barkMat);
+        trunk.position.y = 1.7;
+        trunk.castShadow = true;
+        const holeRim = new THREE.Mesh(new THREE.TorusGeometry(0.46, 0.08, 12, 24), rimMat);
+        holeRim.position.set(0, 0.68, 0.92);
+        const cavity = new THREE.Mesh(new THREE.CircleGeometry(0.42, 24), darkHoleMat);
+        cavity.position.set(0, 0.68, 0.93);
+        const canopy1 = new THREE.Mesh(new THREE.DodecahedronGeometry(1.65, 1), leafMat);
+        canopy1.position.set(0, 3.65, 0);
+        canopy1.castShadow = true;
+        g.add(trunk, holeRim, cavity, canopy1);
+
+      } else if (propSpec.prop_type === 'jungle_giant_leaf') {
+        const leafGeo = new THREE.CylinderGeometry(0.95, 0.95, 0.04, 24);
+        const leafMat = new THREE.MeshPhysicalMaterial({ color: '#22c55e', roughness: 0.3, clearcoat: 0.4 });
+        const veinMat = new THREE.MeshStandardMaterial({ color: '#15803d', roughness: 0.5 });
+        const leaf = new THREE.Mesh(leafGeo, leafMat);
+        leaf.scale.set(1.25, 1.0, 0.82);
+        leaf.position.y = 0.02;
+        leaf.receiveShadow = true;
+        const midrib = new THREE.Mesh(new THREE.BoxGeometry(2.1, 0.03, 0.06), veinMat);
+        midrib.position.y = 0.04;
+        g.add(leaf, midrib);
+
+      } else if (propSpec.prop_type === 'balloon_bundle_red') {
+        const redMat = new THREE.MeshPhysicalMaterial({ color: '#ef4444', roughness: 0.12, clearcoat: 0.95 });
+        const strMat = new THREE.MeshBasicMaterial({ color: '#f8fafc' });
+        for (const bx of [-0.20, 0.20]) {
+          const sp = new THREE.Mesh(new THREE.SphereGeometry(0.19, 20, 20), redMat);
+          sp.position.set(bx, 0.72, 0);
+          sp.castShadow = true;
+          const st = new THREE.Mesh(new THREE.CylinderGeometry(0.006, 0.006, 0.42, 6), strMat);
+          st.position.set(bx, 0.36, 0);
+          g.add(sp, st);
+        }
+        breezeMeshes.push(g);
+
+      } else if (propSpec.prop_type === 'sausage_prop') {
+        const plateMat = new THREE.MeshStandardMaterial({ color: '#f8fafc', roughness: 0.35 });
+        const sMat = new THREE.MeshPhysicalMaterial({ color: '#f43f5e', roughness: 0.25, clearcoat: 0.6 });
+        const plate = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.26, 0.04, 20), plateMat);
+        plate.position.y = 0.02;
+        plate.receiveShadow = true;
+        g.add(plate);
+        for (let k = -1; k <= 1; k++) {
+          const link = new THREE.Mesh(new THREE.CapsuleGeometry(0.048, 0.14, 8, 12), sMat);
+          link.rotation.z = Math.PI / 2;
+          link.position.set(k * 0.15, 0.09, (k % 2) * 0.06);
+          link.castShadow = true;
+          g.add(link);
+        }
+
+      } else if (propSpec.prop_type === 'ocean_water_plane') {
+        const sea = new THREE.Mesh(
+          new THREE.PlaneGeometry(50, 26),
+          new THREE.MeshPhysicalMaterial({ color: '#0ea5e9', roughness: 0.08, clearcoat: 0.95, transparent: true, opacity: 0.86 })
+        );
+        sea.rotation.x = -Math.PI / 2;
+        sea.receiveShadow = true;
+        g.add(sea);
+      }
+      return g;
+    }
+
+    // Real-Time 3D Box (Wall/Truck) + 2D Radial Obstacle + Character Collision Solver
+    function resolveSceneCollisions(actorStates, propColliders, propBoxColliders = []) {
+      for (let pass = 0; pass < 3; pass++) {
+        for (const st of actorStates) {
+          if (st.isSkyBird || st.inMidAirJump) continue;
+          const r = st.radius || 0.42;
+
+          // Solid 3D AABB Walls & Vehicles (never walk through or clip inside!)
+          for (const box of propBoxColliders) {
+            if (!box.active) continue;
+            // Clear if actor is standing cleanly ON TOP of the prop surface
+            if (st.y >= (box.py + box.hy - 0.14)) continue;
+            const limX = box.hx + r * 0.90;
+            const limZ = box.hz + r * 0.90;
+            const dx = st.x - box.px;
+            const dz = st.z - box.pz;
+            if (Math.abs(dx) < limX && Math.abs(dz) < limZ) {
+              const penX = limX - Math.abs(dx);
+              const penZ = limZ - Math.abs(dz);
+              if (penZ <= penX) {
+                st.z = box.pz + (dz >= 0 ? limZ : -limZ);
+              } else {
+                st.x = box.px + (dx >= 0 ? limX : -limX);
+              }
+            }
+          }
+
+          if (st.y > 0.45) continue;
+          for (const col of propColliders) {
+            if (!col.active || col.radius <= 0.01) continue;
+            if (st.inPool && col.isPool) {
+              const dPool = Math.hypot(st.x - col.x, st.z - col.z);
+              if (dPool < col.radius * 0.92) {
+                const maxInner = col.radius * 0.38;
+                if (dPool > maxInner && dPool > 0.001) {
+                  st.x = col.x + ((st.x - col.x) / dPool) * maxInner;
+                  st.z = col.z + ((st.z - col.z) / dPool) * maxInner;
+                }
+                continue;
+              }
+            }
+            const minDist = st.radius + col.radius;
+            let dx = st.x - col.x;
+            let dz = st.z - col.z;
+            let dist = Math.hypot(dx, dz);
+            if (dist < minDist) {
+              if (dist < 0.001) {
+                dx = 0.0;
+                dz = 1.0;
+                dist = 1.0;
+              }
+              const push = minDist - dist;
+              st.x += (dx / dist) * push;
+              st.z += (dz / dist) * push;
+            }
+          }
+        }
+
+        for (let i = 0; i < actorStates.length; i++) {
+          const a = actorStates[i];
+          if (a.isSkyBird || a.inMidAirJump || a.y > 0.45) continue;
+          for (let j = i + 1; j < actorStates.length; j++) {
+            const b = actorStates[j];
+            if (b.isSkyBird || b.inMidAirJump || b.y > 0.45) continue;
+            const minSep = a.radius + b.radius;
+            let dx = b.x - a.x;
+            let dz = b.z - a.z;
+            let dist = Math.hypot(dx, dz);
+            if (dist < minSep) {
+              if (dist < 0.001) {
+                dx = 1.0;
+                dz = 0.0;
+                dist = 1.0;
+              }
+              const overlap = (minSep - dist) * 0.52;
+              const nx = dx / dist;
+              const nz = dz / dist;
+              if (a.inPool && !b.inPool) {
+                b.x += nx * overlap * 2.0;
+                b.z += nz * overlap * 2.0;
+              } else if (b.inPool && !a.inPool) {
+                a.x -= nx * overlap * 2.0;
+                a.z -= nz * overlap * 2.0;
+              } else {
+                a.x -= nx * overlap;
+                a.z -= nz * overlap;
+                b.x += nx * overlap;
+                b.z += nz * overlap;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // Draw 2D HUD Overlay for Fourth-Wall "HELP!" + Like & Comment CTA (Mirrors Reference Video Frame 10!)
+    function drawHudOverlay(ctx, hudMode, progress, tSec, sceneSpec = null) {
+      const hasCliff = Boolean(sceneSpec && sceneSpec.is_cliffhanger_finale);
+      if ((!hudMode || hudMode === 'none') && !hasCliff) return;
+
+      if (hudMode === 'help_like_cta') {
+        // 1. Top-Center Jagged Comic Burst "HELP!" (100% unclipped inside frame!)
+        const hScale = 1.0 + Math.sin(tSec * 8.0) * 0.06;
+        ctx.save();
+        ctx.translate(340, 265);
+        ctx.scale(hScale, hScale);
+        const spikes = 14;
+        ctx.beginPath();
+        for (let i = 0; i < spikes * 2; i++) {
+          const r = (i % 2 === 0) ? 115 : 76;
+          const ang = (i * Math.PI) / spikes;
+          const x = Math.cos(ang) * r;
+          const y = Math.sin(ang) * r * 0.72;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.closePath();
+        ctx.fillStyle = '#facc15';
+        ctx.fill();
+        ctx.lineWidth = 7;
+        ctx.strokeStyle = '#0f172a';
+        ctx.stroke();
+
+        ctx.font = '900 56px Impact, Arial Black, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.lineWidth = 10;
+        ctx.strokeStyle = '#0f172a';
+        ctx.strokeText('HELP!', 0, 4);
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('HELP!', 0, 4);
+        ctx.restore();
+
+        // 2. Bottom Like & Comment Interactive Buttons + Clicking Cursor
+        const likeX = 270, likeY = 1090;
+        const commX = 450, commY = 1090;
+        const isClicked = progress > 0.58;
+        const clickPulse = isClicked ? 1.0 + Math.sin((progress - 0.58) * 22.0) * 0.12 : 1.0;
+
+        // Expanding golden click ring when clicked
+        if (isClicked) {
+          const ringProg = Math.min(1.0, (progress - 0.58) / 0.35);
+          ctx.save();
+          ctx.beginPath();
+          ctx.arc(likeX, likeY, 55 + ringProg * 65, 0, Math.PI * 2);
+          ctx.strokeStyle = `rgba(250, 204, 21, ${1.0 - ringProg})`;
+          ctx.lineWidth = 8;
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // Blue Like Button Circle
+        ctx.save();
+        ctx.translate(likeX, likeY);
+        ctx.scale(clickPulse, clickPulse);
+        ctx.beginPath();
+        ctx.arc(0, 0, 52, 0, Math.PI * 2);
+        ctx.fillStyle = isClicked ? '#2563eb' : '#3b82f6';
+        ctx.fill();
+        ctx.lineWidth = 5;
+        ctx.strokeStyle = '#ffffff';
+        ctx.stroke();
+        ctx.font = '48px Segoe UI Emoji, Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('👍', 0, 2);
+        ctx.restore();
+
+        // Red Comment Button Circle
+        ctx.save();
+        ctx.translate(commX, commY);
+        ctx.beginPath();
+        ctx.arc(0, 0, 52, 0, Math.PI * 2);
+        ctx.fillStyle = '#ef4444';
+        ctx.fill();
+        ctx.lineWidth = 5;
+        ctx.strokeStyle = '#ffffff';
+        ctx.stroke();
+        ctx.font = '46px Segoe UI Emoji, Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('💬', 0, 2);
+        ctx.restore();
+
+        // Animated Cursor Arrow moving in & clicking the Like button
+        const curProg = Math.min(1.0, Math.max(0.0, (progress - 0.20) / 0.38));
+        const curEase = curProg * curProg * (3.0 - 2.0 * curProg);
+        const curX = 390 + (likeX + 18 - 390) * curEase;
+        const curY = 1230 + (likeY + 26 - 1230) * curEase;
+
+        ctx.save();
+        ctx.translate(curX, curY);
+        if (progress > 0.54 && progress < 0.66) {
+          ctx.scale(0.86, 0.86);
+        }
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(0, 54);
+        ctx.lineTo(15, 41);
+        ctx.lineTo(27, 64);
+        ctx.lineTo(37, 59);
+        ctx.lineTo(25, 36);
+        ctx.lineTo(42, 36);
+        ctx.closePath();
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#0f172a';
+        ctx.stroke();
+        ctx.restore();
+      } else if (hudMode === 'like_subscribe_cta') {
+        // Upper Safe-Zone Interactive YouTube Shorts LIKE & SUBSCRIBE Engagement Pill!
+        const entryPop = Math.min(1.0, progress / 0.14);
+        const popScale = entryPop < 1.0 ? (0.4 + 0.6 * (entryPop * entryPop * (3.0 - 2.0 * entryPop))) : 1.0;
+
+        const barW = 588, barH = 104, barX = 360 - barW * 0.5, barY = 126;
+        const likeDone = progress >= 0.34;
+        const subDone = progress >= 0.68;
+
+        ctx.save();
+        ctx.translate(360, barY + barH * 0.5);
+        ctx.scale(popScale, popScale);
+        ctx.translate(-360, -(barY + barH * 0.5));
+
+        // Backdrop frosted pill with gold outline
+        ctx.beginPath();
+        ctx.roundRect(barX, barY, barW, barH, 52);
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.78)';
+        ctx.fill();
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#facc15';
+        ctx.stroke();
+
+        // 1. LIKE Button Pill (left)
+        const likeCX = barX + 132, btnCY = barY + barH * 0.5;
+        const likePulse = likeDone ? 1.0 + Math.sin(Math.max(0, progress - 0.34) * 26.0) * 0.08 * Math.exp(-(progress - 0.34) * 4.0) : 1.0;
+        ctx.save();
+        ctx.translate(likeCX, btnCY);
+        ctx.scale(likePulse, likePulse);
+        ctx.beginPath();
+        ctx.roundRect(-114, -36, 228, 72, 36);
+        ctx.fillStyle = likeDone ? '#2563eb' : '#3b82f6';
+        ctx.fill();
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = likeDone ? '#fde047' : '#ffffff';
+        ctx.stroke();
+        ctx.font = '900 28px Arial Black, Impact, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText(likeDone ? '👍 LIKED!' : '👍 LIKE', 0, 2);
+        ctx.restore();
+
+        if (likeDone && progress < 0.58) {
+          const rp = (progress - 0.34) / 0.24;
+          ctx.beginPath();
+          ctx.arc(likeCX, btnCY, 40 + rp * 54, 0, Math.PI * 2);
+          ctx.strokeStyle = `rgba(96, 165, 250, ${1.0 - rp})`;
+          ctx.lineWidth = 6;
+          ctx.stroke();
+        }
+
+        // 2. SUBSCRIBE Button Pill (right)
+        const subCX = barX + barW - 166;
+        const subPulse = subDone ? 1.0 + Math.sin(Math.max(0, progress - 0.68) * 26.0) * 0.09 * Math.exp(-(progress - 0.68) * 4.0) : 1.0;
+        ctx.save();
+        ctx.translate(subCX, btnCY);
+        ctx.scale(subPulse, subPulse);
+        ctx.beginPath();
+        ctx.roundRect(-146, -36, 292, 72, 36);
+        ctx.fillStyle = subDone ? '#334155' : '#ef4444';
+        ctx.fill();
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = subDone ? '#facc15' : '#ffffff';
+        ctx.stroke();
+        ctx.font = '900 26px Arial Black, Impact, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillStyle = subDone ? '#fde047' : '#ffffff';
+        ctx.fillText(subDone ? '🔔 SUBSCRIBED!' : '🔔 SUBSCRIBE', 0, 2);
+        ctx.restore();
+
+        if (subDone && progress < 0.94) {
+          const rp2 = (progress - 0.68) / 0.26;
+          ctx.beginPath();
+          ctx.arc(subCX, btnCY, 42 + rp2 * 64, 0, Math.PI * 2);
+          ctx.strokeStyle = `rgba(250, 204, 21, ${1.0 - rp2})`;
+          ctx.lineWidth = 6;
+          ctx.stroke();
+        }
+
+        // 3. Smooth Animated Pointer Cursor gliding LIKE -> SUBSCRIBE
+        let curX = likeCX + 26, curY = barY + barH + 55;
+        let pressScale = 1.0;
+        if (progress < 0.36) {
+          const u1 = Math.min(1.0, Math.max(0.0, (progress - 0.10) / 0.22));
+          const e1 = u1 * u1 * (3.0 - 2.0 * u1);
+          curX = 360 + (likeCX + 22 - 360) * e1;
+          curY = (barY + barH + 95) + (btnCY + 14 - (barY + barH + 95)) * e1;
+          if (progress >= 0.30 && progress <= 0.36) pressScale = 0.82;
+        } else {
+          const u2 = Math.min(1.0, Math.max(0.0, (progress - 0.42) / 0.24));
+          const e2 = u2 * u2 * (3.0 - 2.0 * u2);
+          curX = (likeCX + 22) + (subCX + 22 - (likeCX + 22)) * e2;
+          curY = (btnCY + 14) + Math.sin(u2 * Math.PI) * 18;
+          if (progress >= 0.65 && progress <= 0.72) pressScale = 0.82;
+        }
+
+        ctx.save();
+        ctx.translate(curX, curY);
+        ctx.scale(pressScale, pressScale);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(0, 44);
+        ctx.lineTo(12, 33);
+        ctx.lineTo(22, 52);
+        ctx.lineTo(30, 47);
+        ctx.lineTo(20, 29);
+        ctx.lineTo(34, 29);
+        ctx.closePath();
+        ctx.fillStyle = '#ffffff';
+        ctx.fill();
+        ctx.lineWidth = 3.5;
+        ctx.strokeStyle = '#0f172a';
+        ctx.stroke();
+        ctx.restore();
+
+        ctx.restore();
+      }
+
+      // Dynamic Cliffhanger Finale VFX & Unique Curiosity Card (`is_cliffhanger_finale` dedicated 1-2s outro!)
+      if (hasCliff && progress >= 0.02) {
+        const uC = Math.min(1.0, (progress - 0.02) / 0.58);
+        const vStyle = sceneSpec.outro_vfx_style || 'portal_vortex_zoom';
+        const cText = (sceneSpec.cliffhanger_badge_text || 'WHAT HAPPENS NEXT?!').trim().toUpperCase();
+
+        // 1. Style-Specific Cinematic Closing Overlay FX
+        if (vStyle === 'portal_vortex_zoom') {
+          ctx.save();
+          ctx.translate(360, 560);
+          for (let r = 0; r < 28; r++) {
+            const ang = (r / 28) * Math.PI * 2 + tSec * 1.65;
+            const rIn = 310 + Math.sin(tSec * 10.0 + r) * 35;
+            const rOut = 940;
+            ctx.beginPath();
+            ctx.moveTo(Math.cos(ang - 0.03) * rIn, Math.sin(ang - 0.03) * rIn);
+            ctx.lineTo(Math.cos(ang - 0.055) * rOut, Math.sin(ang - 0.055) * rOut);
+            ctx.lineTo(Math.cos(ang + 0.055) * rOut, Math.sin(ang + 0.055) * rOut);
+            ctx.lineTo(Math.cos(ang + 0.03) * rIn, Math.sin(ang + 0.03) * rIn);
+            ctx.closePath();
+            ctx.fillStyle = r % 2 === 0 ? 'rgba(56, 189, 248, 0.36)' : 'rgba(250, 204, 21, 0.30)';
+            ctx.fill();
+          }
+          ctx.restore();
+        } else if (vStyle === 'shockwave_spark_spin') {
+          // Concentric Neon Shockwave Pulse Rings + Magenta/Gold Action Streaks
+          ctx.save();
+          ctx.translate(360, 540);
+          for (let ringI = 0; ringI < 3; ringI++) {
+            const rp = (progress * 1.45 + ringI * 0.33) % 1.0;
+            ctx.beginPath();
+            ctx.arc(0, 0, 140 + rp * 540, 0, Math.PI * 2);
+            ctx.strokeStyle = ringI % 2 === 0
+              ? `rgba(244, 63, 94, ${0.58 * (1.0 - rp)})`
+              : `rgba(250, 204, 21, ${0.52 * (1.0 - rp)})`;
+            ctx.lineWidth = 10 - rp * 5;
+            ctx.stroke();
+          }
+          for (let r = 0; r < 22; r++) {
+            const ang = (r / 22) * Math.PI * 2 - tSec * 1.4;
+            const rIn = 330 + Math.cos(tSec * 11.0 + r) * 30;
+            ctx.beginPath();
+            ctx.moveTo(Math.cos(ang - 0.025) * rIn, Math.sin(ang - 0.025) * rIn);
+            ctx.lineTo(Math.cos(ang - 0.045) * 900, Math.sin(ang - 0.045) * 900);
+            ctx.lineTo(Math.cos(ang + 0.045) * 900, Math.sin(ang + 0.045) * 900);
+            ctx.lineTo(Math.cos(ang + 0.025) * rIn, Math.sin(ang + 0.025) * rIn);
+            ctx.closePath();
+            ctx.fillStyle = r % 2 === 0 ? 'rgba(250, 204, 21, 0.34)' : 'rgba(244, 63, 94, 0.28)';
+            ctx.fill();
+          }
+          ctx.restore();
+        } else if (vStyle === 'iris_freeze_question') {
+          // Dramatic Manga Iris-Edge Vignette + Pulsing "?" Marks
+          ctx.save();
+          const radGrad = ctx.createRadialGradient(360, 560, 240 - uC * 65, 360, 560, 740);
+          radGrad.addColorStop(0.0, 'rgba(15, 23, 42, 0.0)');
+          radGrad.addColorStop(0.7, 'rgba(15, 23, 42, 0.28)');
+          radGrad.addColorStop(1.0, `rgba(15, 23, 42, ${0.74 * uC})`);
+          ctx.fillStyle = radGrad;
+          ctx.fillRect(0, 0, 720, 1280);
+          ctx.restore();
+
+          for (const side of [-1, 1]) {
+            const qScale = (0.78 + uC * 0.42) * (1.0 + Math.sin(tSec * 10.0 + side) * 0.10);
+            ctx.save();
+            ctx.translate(360 + side * 245, 310 + Math.sin(tSec * 6.0 + side) * 16);
+            ctx.rotate(side * 0.24);
+            ctx.scale(qScale, qScale);
+            ctx.font = '900 94px Arial Black, Impact, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.lineWidth = 11;
+            ctx.strokeStyle = '#0f172a';
+            ctx.strokeText('?', 0, 0);
+            ctx.fillStyle = side < 0 ? '#facc15' : '#38bdf8';
+            ctx.fillText('?', 0, 0);
+            ctx.restore();
+          }
+        } else if (vStyle === 'shatter_flash_glint') {
+          // Prismatic Cinema Diagonal Flares + Radiant Border Pulse
+          ctx.save();
+          ctx.strokeStyle = `rgba(250, 204, 21, ${0.88 * (0.45 + 0.55 * Math.sin(tSec * 8.0))})`;
+          ctx.lineWidth = 14;
+          ctx.strokeRect(10, 10, 700, 1260);
+          ctx.translate(360, 480);
+          ctx.rotate(-0.42 + tSec * 0.25);
+          ctx.fillStyle = 'rgba(56, 189, 248, 0.22)';
+          ctx.fillRect(-520, -18, 1040, 36);
+          ctx.rotate(Math.PI / 2);
+          ctx.fillStyle = 'rgba(250, 204, 21, 0.24)';
+          ctx.fillRect(-520, -14, 1040, 28);
+          ctx.restore();
+        }
+
+        // Crisp luminous cut-in impact flash right as 1-2s epilogue starts (`progress 0.0..0.16`)
+        if (progress <= 0.16) {
+          const fAlpha = Math.sin((progress / 0.16) * Math.PI) * 0.45;
+          ctx.fillStyle = `rgba(255, 252, 230, ${fAlpha})`;
+          ctx.fillRect(0, 0, 720, 1280);
+        }
+
+        // 2. Bottom-Safe Dynamic Cliffhanger Curiosity Card (below subtitles y=960 -> strictly y=1112!)
+        const cardPop = Math.min(1.0, (progress - 0.04) / 0.16);
+        if (cardPop > 0) {
+          const cScale = cardPop < 1.0 ? (0.45 + 0.55 * (cardPop * cardPop * (3.0 - 2.0 * cardPop))) : 1.0;
+          const borderHex = vStyle === 'portal_vortex_zoom' ? '#38bdf8' : (vStyle === 'iris_freeze_question' ? '#a855f7' : '#facc15');
+          ctx.save();
+          ctx.translate(360, 1112);
+          ctx.scale(cScale, cScale);
+
+          // Main Curiosity Card
+          ctx.beginPath();
+          ctx.roundRect(-318, -56, 636, 112, 34);
+          ctx.fillStyle = 'rgba(15, 23, 42, 0.90)';
+          ctx.fill();
+          ctx.lineWidth = 5;
+          ctx.strokeStyle = borderHex;
+          ctx.stroke();
+
+          // Small glowing corner ribbon "TO BE CONTINUED..."
+          ctx.beginPath();
+          ctx.roundRect(-185, -80, 370, 36, 18);
+          ctx.fillStyle = '#ef4444';
+          ctx.fill();
+          ctx.lineWidth = 3;
+          ctx.strokeStyle = '#ffffff';
+          ctx.stroke();
+          ctx.font = '900 17px Arial Black, Arial, sans-serif';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText('NEXT PART? COMMENT BELOW! 👇', 0, -62, 340);
+
+          // Dynamic Bouncing Mystery Orb "?"
+          const qPulse = 1.0 + Math.sin(tSec * 9.0) * 0.12;
+          ctx.save();
+          ctx.translate(-258, 0);
+          ctx.scale(qPulse, qPulse);
+          ctx.beginPath();
+          ctx.arc(0, 0, 34, 0, Math.PI * 2);
+          ctx.fillStyle = '#facc15';
+          ctx.fill();
+          ctx.lineWidth = 4;
+          ctx.strokeStyle = '#ffffff';
+          ctx.stroke();
+          ctx.font = '900 42px Arial Black, Impact, sans-serif';
+          ctx.fillStyle = '#0f172a';
+          ctx.fillText('?', 0, 3);
+          ctx.restore();
+
+          // Tailored Story Cliffhanger Text (auto-sized cleanly to never overflow pill)
+          let fontPx = cText.length > 24 ? 23 : (cText.length > 18 ? 27 : 31);
+          ctx.font = `900 ${fontPx}px Arial Black, Impact, sans-serif`;
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.lineWidth = 6;
+          ctx.strokeStyle = '#020617';
+          ctx.strokeText(cText, 32, 2, 505);
+          ctx.fillStyle = '#facc15';
+          ctx.fillText(cText, 32, 2, 505);
+
+          ctx.restore();
+        }
+      }
+    }
+
+    async function postFrameWithRetry(frameIdx, blob) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const res = await fetch('/frame?idx=' + frameIdx, { method: 'POST', body: blob });
+          if (res.ok) return;
+        } catch (_) {
+          await new Promise((r) => setTimeout(r, 25));
+        }
+      }
+    }
+
+    window.renderScenePayload = async function (payload) {
+      const { story, roster, sceneSpec, objectKnowledge, audioEnv, fps, expressionProfiles, motionProfiles } = payload;
+      W = payload.width || 1080;
+      H = payload.height || 1920;
+      renderer.setSize(W, H, false);
+      outCanvas.width = W;
+      outCanvas.height = H;
+      const maxAniso = Math.min(16, renderer.capabilities.getMaxAnisotropy ? renderer.capabilities.getMaxAnisotropy() : 8);
+
+      const knowMap = objectKnowledge || (story && story.object_knowledge) || {};
+      const totalFrames = Math.max(24, Math.round(sceneSpec.duration * fps));
+
+      const scene = new THREE.Scene();
+
+      // 1. Real HDR IBL Studio+Sky PMREM Environment + Atmospheric Sun Sky Dome (GPU RTX 3050 PBR!)
+      try {
+        scene.environment = buildCinemaEnvironmentMap(renderer, story);
+      } catch (e) { }
+      scene.add(buildAtmosphereSkyDome(story));
+      scene.fog = new THREE.FogExp2(story.sky_horizon_hex || '#bae6fd', story.world_biome === 'golden_city' ? 0.0045 : 0.0082);
+
+      // 2. Cinema Three-Point + Warm Pixar Rim Lighting & 4096x4096 High-Res Sun Shadow Map
+      const hemi = new THREE.HemisphereLight('#ffffff', story.ground_primary_hex || '#86efac', 0.72);
+      scene.add(hemi);
+
+      const sun = new THREE.DirectionalLight('#fff4d6', 1.72);
+      sun.position.set(6.5, 11.0, 7.5);
+      sun.castShadow = true;
+      sun.shadow.mapSize.set(2048, 2048);
+      sun.shadow.radius = 2.6;
+      sun.shadow.camera.near = 1.0;
+      sun.shadow.camera.far = 34.0;
+      const d = 8.0;
+      sun.shadow.camera.left = -d;
+      sun.shadow.camera.right = d;
+      sun.shadow.camera.top = d;
+      sun.shadow.camera.bottom = -d;
+      sun.shadow.bias = -0.0003;
+      sun.shadow.normalBias = 0.032;
+      scene.add(sun);
+      scene.add(sun.target);
+
+      // Warm Golden Rim Backlight for crisp hair/shoulder separation from background
+      const rimLight = new THREE.DirectionalLight('#fde68a', 1.15);
+      rimLight.position.set(-5.5, 6.0, -5.5);
+      scene.add(rimLight);
+
+      // Soft cool bounce light from front sky
+      const fillLight = new THREE.DirectionalLight('#e0f2fe', 0.45);
+      fillLight.position.set(-4.0, 2.5, 6.0);
+      scene.add(fillLight);
+
+      // 3. 1024px Normal+Roughness PBR Ground Plane
+      const groundMat = createPBRGroundMaterial(story, maxAniso);
+      const ground = new THREE.Mesh(
+        new THREE.PlaneGeometry(60, 60),
+        groundMat
+      );
+      ground.rotation.x = -Math.PI / 2;
+      ground.receiveShadow = true;
+      scene.add(ground);
+
+      // 4. Living GPU Biome Details (3,200 instanced wind grass blades & flowers OR golden street lamps & skyline ring)
+      const updateBiomeDetails = buildLivingBiomeDetails(scene, story);
+
+      // 5. Setup Multi-Pass MSAA HalfFloat GPU Post-Processing (Bloom + ACES Filmic Color Grade)
+      let cinemaComposer = null;
+      try {
+        cinemaComposer = createCinemaComposer(renderer, W, H);
+        renderer.toneMapping = THREE.NoToneMapping;
+      } catch (e) {
+        cinemaComposer = null;
+      }
+
+      // Biome-Specific Perimeter Backdrop (`wood_picket` / `stone_cliff` / `playground_rail` / `lab_barrier` / `beach_ocean`)
+      const fenceStyle = story.fence_style || 'none';
+      if (fenceStyle === 'wood_picket') {
+        const fenceGroup = new THREE.Group();
+        const woodMat = new THREE.MeshStandardMaterial({ color: '#d99b66', roughness: 0.75 });
+        const woodDarkMat = new THREE.MeshStandardMaterial({ color: '#b0723c', roughness: 0.8 });
+        for (let fx = -7.5; fx <= 7.5; fx += 0.34) {
+          const plank = new THREE.Mesh(new THREE.BoxGeometry(0.28, 1.15 + ((Math.abs(Math.round(fx * 3)) % 3) * 0.06), 0.06), (Math.round(fx * 3) % 2 === 0) ? woodMat : woodDarkMat);
+          plank.position.set(fx, 0.58, -3.85);
+          plank.castShadow = true;
+          plank.receiveShadow = true;
+          fenceGroup.add(plank);
+        }
+        scene.add(fenceGroup);
+      } else if (fenceStyle === 'stone_cliff') {
+        const cliffMat = new THREE.MeshStandardMaterial({ color: '#64748b', roughness: 0.85 });
+        const mossMat = new THREE.MeshStandardMaterial({ color: '#4ade80', roughness: 0.75 });
+        for (let fx = -7.2; fx <= 7.2; fx += 1.45) {
+          const h = 1.4 + ((Math.abs(Math.round(fx * 2)) % 3) * 0.45);
+          const pillar = new THREE.Mesh(new THREE.BoxGeometry(1.38, h, 1.25), cliffMat);
+          pillar.position.set(fx, h * 0.5, -5.2);
+          pillar.castShadow = true;
+          pillar.receiveShadow = true;
+          const cap = new THREE.Mesh(new THREE.BoxGeometry(1.42, 0.16, 1.28), mossMat);
+          cap.position.set(fx, h + 0.06, -5.2);
+          scene.add(pillar, cap);
+        }
+      } else if (fenceStyle === 'playground_rail') {
+        const railColors = ['#facc15', '#38bdf8', '#fb7185', '#34d399'];
+        for (let k = -6; k <= 6; k++) {
+          const post = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.08, 0.09, 0.72, 12),
+            new THREE.MeshStandardMaterial({ color: railColors[Math.abs(k) % railColors.length], roughness: 0.3 })
+          );
+          post.position.set(k * 1.15, 0.36, -4.5);
+          post.castShadow = true;
+          scene.add(post);
+        }
+      } else if (fenceStyle === 'beach_ocean') {
+        const sea = new THREE.Mesh(
+          new THREE.PlaneGeometry(50, 22),
+          new THREE.MeshPhysicalMaterial({ color: '#0ea5e9', roughness: 0.1, clearcoat: 0.9, transparent: true, opacity: 0.85 })
+        );
+        sea.rotation.x = -Math.PI / 2;
+        sea.position.set(0, 0.02, -16.5);
+        scene.add(sea);
+      }
+
+      // Real Fluffy White Volumetric Cumulus Sky Clouds (outdoor scenes only, never inside bedrooms!)
+      const cloudGroups = [];
+      if (story.world_biome !== 'indoor_room') {
+        const cloudBaseY = (story.world_biome === 'golden_city') ? 9.2 : 4.6;
+        for (let c = 0; c < 6; c++) {
+          const cloud = buildCumulusCloud(c, 0.92 + (c % 3) * 0.14);
+          cloud.position.set((c - 2.5) * 2.6, cloudBaseY + (c % 3) * 1.15, -6.5 - (c % 3) * 1.2);
+          scene.add(cloud);
+          cloudGroups.push(cloud);
+        }
+      }
+
+      // Build World Props & Register 2D Colliders (respecting `active_scenes` per scene!)
+      const waterMeshes = [];
+      const breezeMeshes = [];
+      const movingCarList = [];
+      const plazaRings = [];
+      const dynamicLiftChairs = [];
+      const flyingAirplanes = [];
+      const propColliders = [];
+      const propBoxColliders = [];
+      const heroStationObjs = [];
+
+      for (const propSpec of (story.props || [])) {
+        const propObj = await buildEnvironmentProp(propSpec, knowMap, waterMeshes, breezeMeshes, movingCarList, plazaRings, dynamicLiftChairs, flyingAirplanes);
+        const isHeroSpawn = Boolean(propSpec.spawn_on_finale);
+        const isActiveInScene = !propSpec.active_scenes || propSpec.active_scenes.includes(sceneSpec.scene_number);
+        const isVisibleNow = (!isHeroSpawn || Boolean(sceneSpec.show_hero_station)) && isActiveInScene;
+        propObj.visible = isVisibleNow;
+        scene.add(propObj);
+
+        if (isHeroSpawn) {
+          heroStationObjs.push({ obj: propObj, targetScale: propSpec.scale || 1.0 });
+        }
+
+        if (propSpec.collision_radius && propSpec.collision_radius > 0.01) {
+          propColliders.push({
+            x: propSpec.position[0],
+            z: propSpec.position[2],
+            radius: propSpec.collision_radius,
+            isPool: Boolean(propSpec.is_pool),
+            refObj: propObj,
+            isMovingCar: propSpec.prop_type === 'moving_car',
+            active: isVisibleNow,
+          });
+        }
+        if (propSpec.aabb_half_extents && propSpec.aabb_half_extents.length === 3) {
+          propBoxColliders.push({
+            px: propSpec.position[0],
+            py: propSpec.position[1],
+            pz: propSpec.position[2],
+            hx: propSpec.aabb_half_extents[0],
+            hy: propSpec.aabb_half_extents[1],
+            hz: propSpec.aabb_half_extents[2],
+            active: isVisibleNow,
+          });
+        }
+      }
+
+      // Environmental Ripples & Falling Leaves
+      const fxStyle = story.environment_fx_style || 'water_ripples_and_breeze';
+      const rippleRings = [];
+      const fallingLeaves = [];
+
+      if (fxStyle === 'water_ripples_and_breeze') {
+        for (const p of (story.props || [])) {
+          if (p.is_pool && (!p.spawn_on_finale || sceneSpec.show_hero_station)) {
+            const [px, , pz] = p.position;
+            for (let r = 0; r < 2; r++) {
+              const rMat = new THREE.MeshBasicMaterial({
+                color: '#e0f2fe',
+                transparent: true,
+                opacity: 0.55,
+                side: THREE.DoubleSide,
+              });
+              const rMesh = new THREE.Mesh(new THREE.RingGeometry(0.25, 0.30, 32), rMat);
+              rMesh.rotation.x = -Math.PI / 2;
+              rMesh.position.set(px, 0.40, pz);
+              scene.add(rMesh);
+              rippleRings.push({ mesh: rMesh, mat: rMat, phase: r * 0.5 + px * 0.2 });
+            }
+          }
+        }
+      } else {
+        const leafColors = ['#fbbf24', '#fb7185', '#f97316', '#34d399', '#f472b6'];
+        const leafGeo = new THREE.PlaneGeometry(0.11, 0.07);
+        for (let i = 0; i < 18; i++) {
+          const lMat = new THREE.MeshStandardMaterial({
+            color: leafColors[i % leafColors.length],
+            roughness: 0.4,
+            side: THREE.DoubleSide,
+          });
+          const leaf = new THREE.Mesh(leafGeo, lMat);
+          scene.add(leaf);
+          fallingLeaves.push({
+            mesh: leaf,
+            baseX: ((i % 9) - 4.0) * 1.05,
+            baseZ: -1.6 - (i % 4) * 1.1,
+            speed: 0.55 + (i % 3) * 0.18,
+            phase: i * 0.37,
+          });
+        }
+      }
+
+      // 3D Cliffhanger Outro Halo & Spiral Energy Star Shards (distinct glow colors per `outro_vfx_style`!)
+      let outroVfxRig = null;
+      if (sceneSpec.is_cliffhanger_finale) {
+        const og = new THREE.Group();
+        const oStyle = sceneSpec.outro_vfx_style || 'portal_vortex_zoom';
+        const cPrimary = oStyle === 'portal_vortex_zoom' ? '#38bdf8' : (oStyle === 'iris_freeze_question' ? '#c084fc' : '#facc15');
+        const cSecondary = oStyle === 'shockwave_spark_spin' ? '#f43f5e' : '#fef08a';
+
+        const ringMat1 = new THREE.MeshBasicMaterial({ color: cPrimary, transparent: true, opacity: 0.56 });
+        const ringMat2 = new THREE.MeshBasicMaterial({ color: cSecondary, transparent: true, opacity: 0.52 });
+        const outerHalo = new THREE.Mesh(new THREE.TorusGeometry(0.84, 0.022, 10, 40), ringMat1);
+        outerHalo.rotation.x = Math.PI / 2;
+        const orbitRing = new THREE.Mesh(new THREE.TorusGeometry(0.66, 0.016, 8, 36), ringMat2);
+        orbitRing.rotation.x = 1.25;
+        orbitRing.rotation.y = 0.35;
+        og.add(outerHalo, orbitRing);
+
+        const shardGeo = new THREE.OctahedronGeometry(0.075, 0);
+        const shards = [];
+        for (let k = 0; k < 14; k++) {
+          const sMat = new THREE.MeshPhysicalMaterial({
+            color: k % 2 === 0 ? cPrimary : cSecondary,
+            emissive: k % 2 === 0 ? cPrimary : cSecondary,
+            emissiveIntensity: 0.65,
+            roughness: 0.15,
+          });
+          const sMesh = new THREE.Mesh(shardGeo, sMat);
+          og.add(sMesh);
+          shards.push({ mesh: sMesh, ang: (k / 14) * Math.PI * 2, hOff: (k % 5) * 0.28, spd: 1.8 + (k % 3) * 0.45 });
+        }
+        og.visible = false;
+        scene.add(og);
+        outroVfxRig = { group: og, outerHalo, orbitRing, shards };
+      }
+
+      // Reusable 3D Action FX Burst Meshes (Water Splash / Magic Spawn Ring / Confetti Burst)
+      const fxBursts = [];
+      for (const act of sceneSpec.actors) {
+        for (const ph of (act.phases || [])) {
+          if (ph.fx_trigger) {
+            const bGroup = new THREE.Group();
+            bGroup.position.set(ph.to_pos[0], Math.max(0.05, ph.to_pos[1]), ph.to_pos[2]);
+            bGroup.visible = false;
+
+            if (ph.fx_trigger === 'water_splash' || ph.fx_trigger === 'magic_spawn_ring' || ph.fx_trigger === 'dust_puff') {
+              const ringColor = ph.fx_trigger === 'magic_spawn_ring' ? '#facc15' : (ph.fx_trigger === 'water_splash' ? '#7dd3fc' : '#f1f5f9');
+              const rMat = new THREE.MeshBasicMaterial({ color: ringColor, transparent: true, opacity: 0.85, side: THREE.DoubleSide });
+              const ringMesh = new THREE.Mesh(new THREE.RingGeometry(0.35, 0.52, 32), rMat);
+              ringMesh.rotation.x = -Math.PI / 2;
+              ringMesh.position.y = ph.fx_trigger === 'water_splash' ? 0.32 : 0.04;
+              bGroup.add(ringMesh);
+
+              // 8 splash/sparkle droplets rising in a crown
+              const dropGeo = new THREE.BoxGeometry(0.08, 0.14, 0.08);
+              const drops = [];
+              for (let k = 0; k < 8; k++) {
+                const dMat = new THREE.MeshBasicMaterial({ color: ringColor, transparent: true, opacity: 0.9 });
+                const dMesh = new THREE.Mesh(dropGeo, dMat);
+                const ang = (k / 8) * Math.PI * 2;
+                bGroup.add(dMesh);
+                drops.push({ mesh: dMesh, ang, mat: dMat });
+              }
+              scene.add(bGroup);
+              fxBursts.push({
+                type: ph.fx_trigger,
+                group: bGroup,
+                ringMesh,
+                rMat,
+                drops,
+                triggerRatio: ph.fx_trigger === 'magic_spawn_ring' ? ph.start_ratio : (ph.end_ratio - 0.08),
+              });
+            } else if (ph.fx_trigger === 'confetti_burst') {
+              const confColors = ['#f43f5e', '#facc15', '#38bdf8', '#a855f7', '#10b981'];
+              const confGeo = new THREE.PlaneGeometry(0.10, 0.06);
+              const drops = [];
+              for (let k = 0; k < 24; k++) {
+                const dMat = new THREE.MeshBasicMaterial({ color: confColors[k % confColors.length], side: THREE.DoubleSide });
+                const dMesh = new THREE.Mesh(confGeo, dMat);
+                const ang = (k / 24) * Math.PI * 2;
+                bGroup.add(dMesh);
+                drops.push({ mesh: dMesh, ang, speed: 0.6 + (k % 4) * 0.25, yOff: (k % 3) * 0.3 });
+              }
+              scene.add(bGroup);
+              fxBursts.push({
+                type: 'confetti_burst',
+                group: bGroup,
+                drops,
+                triggerRatio: ph.start_ratio + 0.05,
+              });
+            }
+          }
+        }
+      }
+
+      // Instantiate All 11 Rigged 3D `.glb` Characters & Multi-Mode Animation Mixers
+      const kaykitClips = await getSharedKayKitClips();
+      const charMap = new Map();
+
+      for (let cIdx = 0; cIdx < roster.characters.length; cIdx++) {
+        const cSpec = roster.characters[cIdx];
+        const gltf = await loadGLB(cSpec.glb_model);
+        if (!gltf || !gltf.scene) continue;
+
+        const cloned = SkeletonUtils.clone(gltf.scene);
+        const mixer = new THREE.AnimationMixer(cloned);
+        const availableClips = (gltf.animations && gltf.animations.length > 0)
+          ? gltf.animations
+          : kaykitClips;
+
+        const actionsMap = buildCharacterActionsMap(mixer, availableClips, cSpec.role, cSpec.rig_family || '', cIdx + sceneSpec.scene_number);
+        const { headBone, spineBone, upperArmL, upperArmR } = findBestHeadAndSpineBones(cloned);
+        // Capture clean bind-rest quaternions BEFORE any clip loops/overlays run
+        const headRestQuat = headBone ? headBone.quaternion.clone() : null;
+        const spineRestQuat = spineBone ? spineBone.quaternion.clone() : null;
+        const upperArmLRestQuat = upperArmL ? upperArmL.quaternion.clone() : null;
+        const upperArmRRestQuat = upperArmR ? upperArmR.quaternion.clone() : null;
+
+        const initialMode = 'idle';
+        if (actionsMap[initialMode]) {
+          actionsMap[initialMode].play();
+          mixer.setTime((cIdx * 0.31) % 1.2);
+        }
+
+        const { wrapper, modelHolder } = normalizeAndWrapGLB(
+          cloned,
+          cSpec.target_height_m || 1.48,
+          cSpec.scale || 1.0
+        );
+
+        const contactDisc = enhanceCharacterMaterialsAndContactShadow(
+          cloned,
+          wrapper,
+          (cSpec.target_height_m || 1.48) * (cSpec.scale || 1.0)
+        );
+        const faceRig = attachExpressiveFaceRig(cloned, wrapper, headBone, cSpec);
+
+        // Hover Lift Platform (ONLY if there is no `hydraulic_lift_chair` prop holding the character!)
+        const hoverPad = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.42, 0.34, 0.12, 24),
+          new THREE.MeshPhysicalMaterial({ color: '#38bdf8', emissive: '#0284c7', roughness: 0.2, metalness: 0.5 })
+        );
+        hoverPad.position.set(0, -0.06, 0);
+        hoverPad.visible = false;
+        wrapper.add(hoverPad);
+
+        // Overhead 3D Emote Bubble Sprite
+        const spriteMat = new THREE.SpriteMaterial({ transparent: true, depthTest: false });
+        const emoteSprite = new THREE.Sprite(spriteMat);
+        emoteSprite.position.set(0, (cSpec.target_height_m || 1.48) * (cSpec.scale || 1.0) + 0.28, 0);
+        emoteSprite.scale.set(0.48, 0.48, 1.0);
+        emoteSprite.visible = false;
+        wrapper.add(emoteSprite);
+
+        scene.add(wrapper);
+        charMap.set(cSpec.char_id, {
+          wrapper,
+          modelHolder,
+          hoverPad,
+          isQuadOrBird: (
+            cSpec.rig_family === 'animal_quadruped' ||
+            cSpec.rig_family === 'dinosaur' ||
+            cSpec.rig_family === 'sky_bird' ||
+            cSpec.role === 'pet_animal' ||
+            cSpec.role === 'wild_creature' ||
+            cSpec.role === 'sky_bird'
+          ),
+          baseModelY: modelHolder.position.y,
+          currentYOff: 0.0,
+          headBone,
+          spineBone,
+          upperArmL,
+          upperArmR,
+          contactDisc,
+          headRestQuat,
+          spineRestQuat,
+          upperArmLRestQuat,
+          upperArmRRestQuat,
+          smoothSpineTilt: 0.0,
+          faceRig,
+          cloned,
+          mixer,
+          actionsMap,
+          activeMode: initialMode,
+          emoteSprite,
+          currentEmote: null,
+          spec: cSpec,
+          currentAngle: 0.0,
+          angleInitialized: false,
+        });
+      }
+
+      const camera = new THREE.PerspectiveCamera(50, W / H, 0.1, 60);
+      const dtLerp = 1.0 - Math.exp(-8.5 / Math.max(24, fps));
+
+      // Frame-by-frame deterministic stepping
+      for (let f = 0; f < totalFrames; f++) {
+        const tSec = f / fps;
+        const progress = totalFrames > 1 ? f / (totalFrames - 1) : 0;
+        const mouthVal = (audioEnv && f < audioEnv.length) ? audioEnv[f] : 0.30;
+
+        // 1. Update Camera from SceneDirectingSpec shots
+        let activeShot = sceneSpec.camera_shots[0];
+        for (const sh of sceneSpec.camera_shots) {
+          if (progress >= sh.start_ratio && progress <= sh.end_ratio) {
+            activeShot = sh;
+            break;
+          }
+        }
+        const shotSpan = Math.max(0.01, activeShot.end_ratio - activeShot.start_ratio);
+        const shotU = Math.max(0, Math.min(1, (progress - activeShot.start_ratio) / shotSpan));
+        const uSmooth = shotU * shotU * shotU * (shotU * (shotU * 6.0 - 15.0) + 10.0);
+
+        camera.fov = sceneSpec.is_cliffhanger_finale
+          ? (47.0 - 9.0 * (progress * progress * (3.0 - 2.0 * progress)))
+          : (activeShot.fov_deg || 50);
+        camera.updateProjectionMatrix();
+        camera.position.set(
+          activeShot.cam_start[0] + (activeShot.cam_end[0] - activeShot.cam_start[0]) * uSmooth,
+          activeShot.cam_start[1] + (activeShot.cam_end[1] - activeShot.cam_start[1]) * uSmooth,
+          activeShot.cam_start[2] + (activeShot.cam_end[2] - activeShot.cam_start[2]) * uSmooth
+        );
+        const lx = activeShot.look_start[0] + (activeShot.look_end[0] - activeShot.look_start[0]) * uSmooth;
+        const ly = activeShot.look_start[1] + (activeShot.look_end[1] - activeShot.look_start[1]) * uSmooth;
+        const lz = activeShot.look_start[2] + (activeShot.look_end[2] - activeShot.look_start[2]) * uSmooth;
+        camera.lookAt(lx, ly, lz);
+        const camFocusDist = Math.hypot(camera.position.x - lx, camera.position.y - ly, camera.position.z - lz);
+
+        // Keep high-res directional sun shadows & rim light dynamically tracking active focus elevation!
+        sun.position.set(lx + 6.5, ly + 11.0, lz + 7.5);
+        sun.target.position.set(lx, Math.max(0.0, ly - 0.8), lz);
+        sun.target.updateMatrixWorld();
+        rimLight.position.set(lx - 5.5, ly + 5.5, lz - 5.5);
+
+        // 2. Animate Finale Hero Station Spawn (`spawn_on_finale`)
+        if (sceneSpec.show_hero_station) {
+          const spawnU = Math.min(1.0, progress / 0.26);
+          const elasticScale = spawnU < 1.0
+            ? spawnU * spawnU * (2.5 - 1.5 * spawnU)
+            : 1.0;
+          for (const hs of heroStationObjs) {
+            hs.obj.scale.setScalar(Math.max(0.05, hs.targetScale * elasticScale));
+          }
+        }
+
+        // 3. Update Moving Car Prop
+        for (const mc of movingCarList) {
+          mc.position.x = -3.8 + progress * 7.6;
+        }
+        for (const col of propColliders) {
+          if (col.isMovingCar && col.refObj) {
+            col.x = col.refObj.position.x;
+          }
+        }
+
+        // 4. Evaluate Multi-Phase Choreography Timeline (`actor.phases`) for Each Character
+        const actorStates = [];
+        for (let aIdx = 0; aIdx < sceneSpec.actors.length; aIdx++) {
+          const actor = sceneSpec.actors[aIdx];
+          const entry = charMap.get(actor.char_id);
+          if (!entry) continue;
+
+          // Find active phase at current `progress`
+          const phases = (actor.phases && actor.phases.length > 0)
+            ? actor.phases
+            : [{
+              start_ratio: 0.0,
+              end_ratio: 1.0,
+              from_pos: actor.start_pos,
+              to_pos: actor.end_pos,
+              jump_arc_height: 0.0,
+              anim_mode: actor.action === 'fly' ? 'fly' : 'idle',
+              action: actor.action,
+              expression: actor.expression || 'happy',
+              spine_tilt_x: 0.0,
+              head_pitch: 0.0,
+              head_yaw_osc: 0.08,
+              head_nod_osc: 0.08,
+              y_offset: 0.0,
+              look_at: actor.look_at_target,
+              in_pool: actor.in_pool,
+            }];
+
+          let activePhase = phases[phases.length - 1];
+          for (const ph of phases) {
+            if (progress >= ph.start_ratio && progress <= ph.end_ratio) {
+              activePhase = ph;
+              break;
+            }
+          }
+
+          const phSpan = Math.max(0.005, activePhase.end_ratio - activePhase.start_ratio);
+          const uPhase = Math.max(0.0, Math.min(1.0, (progress - activePhase.start_ratio) / phSpan));
+          // Smooth ease for phase travel
+          const isContinuousMotion = (
+            activePhase.jump_arc_height > 0.05 ||
+            activePhase.anim_mode === 'fly' ||
+            activePhase.anim_mode === 'pet_walk' ||
+            activePhase.anim_mode === 'pet_run' ||
+            actor.action === 'pet_walk' ||
+            actor.action === 'fly'
+          );
+          const uTravel = isContinuousMotion
+            ? uPhase
+            : (uPhase * uPhase * uPhase * (uPhase * (uPhase * 6.0 - 15.0) + 10.0));
+
+          const x = activePhase.from_pos[0] + (activePhase.to_pos[0] - activePhase.from_pos[0]) * uTravel;
+          const baseY = activePhase.from_pos[1] + (activePhase.to_pos[1] - activePhase.from_pos[1]) * uTravel;
+          const z = activePhase.from_pos[2] + (activePhase.to_pos[2] - activePhase.from_pos[2]) * uTravel;
+
+          // 3D Parabolic Jump Arc (`jump_arc_height` — strictly 0.0 unless action is explicitly jump!)
+          const arcH = activePhase.jump_arc_height || 0.0;
+          const arcY = arcH > 0.01 ? (4.0 * arcH * uPhase * (1.0 - uPhase)) : 0.0;
+          const y = baseY + arcY;
+          const inMidAirJump = (arcH > 0.20 && uPhase > 0.10 && uPhase < 0.90);
+
+          actorStates.push({
+            aIdx,
+            actor,
+            entry,
+            activePhase,
+            uPhase,
+            x,
+            y,
+            z,
+            radius: actor.collision_radius ?? 0.42,
+            inPool: Boolean(activePhase.in_pool),
+            inMidAirJump,
+            isSkyBird: (actor.action === 'fly' || activePhase.anim_mode === 'fly'),
+          });
+        }
+
+        resolveSceneCollisions(actorStates, propColliders, propBoxColliders);
+
+        // 5. Apply Positions, Rotations, Grounded Knowledge-Base Animations & Facial/Head Expressions
+        let maxRiderY = 0.0;
+        let riderPosX = 0.55, riderPosZ = 0.20;
+        let hasLiftRider = false;
+        for (const st of actorStates) {
+          if (st.actor.action === 'sit_chair_or_bench' || st.y > 0.2) {
+            hasLiftRider = true;
+            maxRiderY = Math.max(maxRiderY, st.y);
+            riderPosX = st.x;
+            riderPosZ = st.z;
+          }
+        }
+        const hasVisibleChair = dynamicLiftChairs.some((lc) => lc.group.visible);
+        for (const lc of dynamicLiftChairs) {
+          if (!lc.group.visible) continue;
+          if (hasLiftRider) {
+            lc.group.position.set(riderPosX, 0.0, riderPosZ);
+          }
+          const seatHeight = Math.max(0.36, maxRiderY + 0.24);
+          lc.seatGroup.position.y = seatHeight;
+          const poleH = Math.max(0.15, seatHeight - 0.06);
+          lc.pole.scale.y = poleH;
+          lc.pole.position.y = poleH * 0.5;
+          lc.pedal.rotation.z = 0.14 + Math.sin(tSec * 6.0) * 0.12;
+        }
+        for (const plane of flyingAirplanes) {
+          plane.position.x = -5.0 + progress * 10.0;
+        }
+
+        for (const st of actorStates) {
+          const { actor, entry, activePhase, uPhase, x, y, z } = st;
+          const dx = activePhase.to_pos[0] - activePhase.from_pos[0];
+          const dz = activePhase.to_pos[2] - activePhase.from_pos[2];
+          const phaseDist = Math.hypot(dx, dz);
+          const phaseDurSec = Math.max(0.08, (activePhase.end_ratio - activePhase.start_ratio) * sceneSpec.duration);
+          const speedMps = phaseDist / phaseDurSec;
+
+          const speechBob = (actor.is_speaking && !['sit_floor', 'sit_chair', 'lie_down'].includes(activePhase.anim_mode))
+            ? Math.sin(tSec * 9.0) * 0.010 * mouthVal
+            : 0.0;
+          entry.wrapper.position.set(x, y + speechBob, z);
+          if (entry.contactDisc) {
+            entry.contactDisc.visible = (y < 0.8);
+            if (y < 0.8) {
+              entry.contactDisc.position.y = Math.max(0.006, 0.008 - y);
+              const shFade = Math.max(0.15, 0.85 * (1.0 - y / 0.85));
+              entry.contactDisc.material.opacity = shFade;
+            }
+          }
+          if (entry.hoverPad) {
+            const allowHoverPad = (story.world_biome === 'golden_city' || story.world_biome === 'futuristic_lab');
+            entry.hoverPad.visible = (allowHoverPad && !hasVisibleChair && y > 0.22 && (activePhase.jump_arc_height || 0.0) < 0.05);
+          }
+
+          // Determine facing direction: face travel vector when moving, or forward (+Z) when seated in lift chair!
+          const camAngle = Math.atan2(camera.position.x - x, camera.position.z - z);
+          const isRidingLift = (hasVisibleChair && (actor.action === 'sit_chair_or_bench' || activePhase.anim_mode === 'sit_chair' || y > 0.25));
+          let desiredAngle = camAngle;
+          if (isRidingLift) {
+            desiredAngle = Math.max(-0.35, Math.min(0.35, camAngle * 0.25));
+          } else if (entry.isQuadOrBird || activePhase.anim_mode === 'fly' || activePhase.anim_mode === 'pet_walk' || activePhase.anim_mode === 'pet_run') {
+            desiredAngle = phaseDist > 0.05 ? Math.atan2(dx, dz) : camAngle;
+          } else if (phaseDist > 0.22 && speedMps >= 0.28) {
+            const moveAngle = Math.atan2(dx, dz);
+            desiredAngle = lerpAngle(moveAngle, camAngle, 0.15);
+          } else if (activePhase.look_at) {
+            const targetAngle = Math.atan2(activePhase.look_at[0] - x, activePhase.look_at[2] - z);
+            desiredAngle = lerpAngle(targetAngle, camAngle, 0.25);
+          }
+
+          if (!entry.angleInitialized) {
+            entry.currentAngle = desiredAngle;
+            entry.angleInitialized = true;
+          } else {
+            const dtBody = 1.0 - Math.exp(-5.0 / Math.max(24, fps));
+            entry.currentAngle = lerpAngle(entry.currentAngle, desiredAngle, dtBody);
+          }
+          entry.wrapper.rotation.y = entry.currentAngle;
+          if (isRidingLift) {
+            for (const lc of dynamicLiftChairs) {
+              if (lc.group.visible) lc.group.rotation.y = entry.currentAngle;
+            }
+          }
+
+          // Grounded Knowledge-Base + Velocity-Matched Animation Mode Selection (Zero constant jumping or walking in place!)
+          const kbAnim = activePhase.anim_mode || 'idle';
+          let desiredMode = 'idle';
+          let animTimeScale = 1.0;
+
+          if (kbAnim === 'fly') {
+            desiredMode = 'fly';
+            animTimeScale = 1.1;
+          } else if ((activePhase.jump_arc_height || 0) > 0.15 || kbAnim === 'jump') {
+            desiredMode = entry.actionsMap['jump'] ? 'jump' : (entry.actionsMap['cheer'] ? 'cheer' : 'idle');
+            animTimeScale = 1.15;
+          } else if (speedMps >= 1.10) {
+            desiredMode = (kbAnim === 'pet_walk' || kbAnim === 'pet_run') && entry.actionsMap['pet_run'] ? 'pet_run' : 'run';
+            animTimeScale = Math.min(1.38, Math.max(0.85, speedMps / 1.85));
+          } else if (speedMps >= 0.22) {
+            if (kbAnim === 'sneak' && entry.actionsMap['sneak']) {
+              desiredMode = 'sneak';
+              animTimeScale = Math.min(1.15, Math.max(0.75, speedMps / 0.90));
+            } else if ((kbAnim === 'pet_walk' || kbAnim === 'pet_run') && entry.actionsMap['pet_walk']) {
+              desiredMode = 'pet_walk';
+              animTimeScale = Math.min(1.25, Math.max(0.80, speedMps / 1.05));
+            } else {
+              desiredMode = 'walk';
+              animTimeScale = Math.min(1.25, Math.max(0.80, speedMps / 1.05));
+            }
+          } else {
+            // Stationary grounded acting: sit_floor, sit_chair, lie_down, interact, pickup, cheer, dance, wave, or idle!
+            const allowedStationary = ['sit_floor', 'sit_chair', 'lie_down', 'interact', 'pickup', 'cheer', 'dance', 'wave', 'idle'];
+            desiredMode = (allowedStationary.includes(kbAnim) && entry.actionsMap[kbAnim]) ? kbAnim : 'idle';
+            animTimeScale = (kbAnim === 'pickup' || kbAnim === 'interact') ? 0.85 : 1.0;
+          }
+
+          if (sceneSpec.is_cliffhanger_finale && progress >= 0.14) {
+            const freezeU = Math.min(1.0, (progress - 0.14) / 0.48);
+            animTimeScale *= (1.0 - 0.74 * freezeU);
+          }
+
+          if (!entry.actionsMap[desiredMode]) {
+            desiredMode = entry.actionsMap['idle'] ? 'idle' : entry.activeMode;
+          }
+
+          // Switch skeletal animation clip smoothly when phase mode changes
+          if (desiredMode !== entry.activeMode && entry.actionsMap[desiredMode]) {
+            const prevAct = entry.actionsMap[entry.activeMode];
+            const nextAct = entry.actionsMap[desiredMode];
+            if (prevAct) prevAct.fadeOut(0.24);
+            nextAct.reset().fadeIn(0.24).play();
+            entry.activeMode = desiredMode;
+          }
+
+          // Apply grounded vertical posture offset (e.g. sitting/lying/sneaking crouch)
+          const targetYOff = activePhase.y_offset || 0.0;
+          entry.currentYOff += (targetYOff - entry.currentYOff) * dtLerp;
+          entry.modelHolder.position.y = entry.baseModelY + entry.currentYOff;
+
+          // Reset un-keyframed head/spine bones to rest before mixer step -> ZERO 360-deg neck twist accumulation!
+          if (entry.headBone && entry.headRestQuat) {
+            entry.headBone.quaternion.copy(entry.headRestQuat);
+          }
+          if (entry.spineBone && entry.spineRestQuat) {
+            entry.spineBone.quaternion.copy(entry.spineRestQuat);
+          }
+
+          entry.mixer.update((1 / fps) * animTimeScale);
+
+          // Anatomically safe wrapper-space spine lean & eased natural head pose + facial expression / lip-sync rig
+          applySafeHeadAndSpinePose(entry, activePhase, tSec, st.aIdx, actor.is_speaking, mouthVal, fps, uPhase, motionProfiles);
+          updateExpressiveFaceRig(entry.faceRig, activePhase.expression, actor.is_speaking, mouthVal, tSec, st.aIdx, expressionProfiles);
+
+          // Update Overhead 3D Comic Emote Bubble (`!`, `?`, `broken_heart`, `star`, `heart`, `music`)
+          const bubbleType = activePhase.emote_bubble || null;
+          if (bubbleType && bubbleType !== 'help') {
+            if (entry.currentEmote !== bubbleType) {
+              entry.emoteSprite.material.map = getEmoteTexture(bubbleType);
+              entry.emoteSprite.material.needsUpdate = true;
+              entry.currentEmote = bubbleType;
+            }
+            entry.emoteSprite.visible = true;
+            const popScale = sceneSpec.is_cliffhanger_finale ? 0.42 : 0.46;
+            const pulse = popScale * (1.0 + Math.sin(tSec * 8.0) * 0.08);
+            entry.emoteSprite.scale.set(pulse, pulse, 1.0);
+          } else {
+            entry.emoteSprite.visible = false;
+          }
+        }
+
+        // 6. Animate 3D Action FX Bursts (Water Splashes, Magic Spawn Rings, Confetti Bursts)
+        for (const fb of fxBursts) {
+          const dt = progress - fb.triggerRatio;
+          if (dt >= 0.0 && dt <= 0.32) {
+            const uFx = dt / 0.32;
+            fb.group.visible = true;
+            if (fb.type === 'confetti_burst') {
+              for (const d of fb.drops) {
+                const rad = 0.25 + uFx * 1.35 * d.speed;
+                d.mesh.position.set(
+                  Math.cos(d.ang + uFx * 2.0) * rad,
+                  1.65 * (1.0 - uFx) + d.yOff + Math.sin(uFx * Math.PI) * 0.8,
+                  Math.sin(d.ang + uFx * 2.0) * rad
+                );
+                d.mesh.rotation.set(tSec * 6.0, tSec * 4.0, d.ang);
+              }
+            } else {
+              const sc = 0.5 + uFx * 1.9;
+              fb.ringMesh.scale.set(sc, sc, 1.0);
+              fb.rMat.opacity = (1.0 - uFx) * 0.85;
+              for (const d of fb.drops) {
+                const rad = 0.35 + uFx * 0.85;
+                const lift = 4.0 * 0.55 * uFx * (1.0 - uFx);
+                d.mesh.position.set(Math.cos(d.ang) * rad, 0.25 + lift, Math.sin(d.ang) * rad);
+                d.mat.opacity = 1.0 - uFx;
+              }
+            }
+          } else {
+            fb.group.visible = false;
+          }
+        }
+
+        // 7. Update Ambient World Effects
+        for (let i = 0; i < waterMeshes.length; i++) {
+          waterMeshes[i].position.y = 0.20 + Math.sin(tSec * 3.5 + i) * 0.012;
+        }
+        for (let i = 0; i < breezeMeshes.length; i++) {
+          breezeMeshes[i].rotation.z = Math.sin(tSec * 2.2 + i * 0.9) * 0.028;
+        }
+        for (let i = 0; i < plazaRings.length; i++) {
+          plazaRings[i].rotation.z = tSec * 0.65 + i * 0.5;
+        }
+        for (const cg of cloudGroups) {
+          cg.position.x = ((cg.position.x + 0.004 + 8.0) % 16.0) - 8.0;
+        }
+        for (const rp of rippleRings) {
+          const cyc = (tSec * 0.65 + rp.phase) % 1.0;
+          const sc = 0.65 + cyc * 1.45;
+          rp.mesh.scale.set(sc, sc, 1.0);
+          rp.mat.opacity = (1.0 - cyc) * 0.55;
+        }
+        for (const lf of fallingLeaves) {
+          const cyc = (tSec * 0.22 * lf.speed + lf.phase) % 1.0;
+          lf.mesh.position.set(
+            lf.baseX + Math.sin(tSec * 2.0 + lf.phase) * 0.35,
+            3.6 * (1.0 - cyc) + 0.15,
+            lf.baseZ + Math.cos(tSec * 1.5 + lf.phase) * 0.20
+          );
+          lf.mesh.rotation.set(
+            tSec * 1.8 + lf.phase,
+            tSec * 2.4 + lf.phase,
+            Math.sin(tSec * 3.0 + lf.phase) * 0.5
+          );
+        }
+
+        updateBiomeDetails(tSec);
+
+        // Animate 3D Cliffhanger Spinning Halo & Spiral Star Shards around focal character across entire 1-2s outro
+        if (outroVfxRig) {
+          if (actorStates.length > 0) {
+            const uVfx = Math.min(1.0, progress / 0.20);
+            let focusSt = actorStates[0];
+            let bestDist = Infinity;
+            for (const st of actorStates) {
+              const d = Math.hypot(st.x - lx, st.z - lz);
+              if (d < bestDist) {
+                bestDist = d;
+                focusSt = st;
+              }
+            }
+            outroVfxRig.group.visible = true;
+            outroVfxRig.group.position.set(focusSt.x, focusSt.y + 0.06, focusSt.z - 0.16);
+            outroVfxRig.group.scale.setScalar(0.28 + 0.78 * uVfx);
+            outroVfxRig.outerHalo.rotation.z = tSec * 4.4;
+            outroVfxRig.outerHalo.position.y = 0.26 + Math.sin(tSec * 5.0) * 0.12;
+            outroVfxRig.orbitRing.rotation.z = -tSec * 5.6;
+            outroVfxRig.orbitRing.rotation.y = tSec * 2.8;
+            outroVfxRig.orbitRing.position.y = 0.86;
+            for (const sh of outroVfxRig.shards) {
+              const a = sh.ang + tSec * sh.spd * 1.25;
+              const r = 0.82 + Math.sin(tSec * 5.5 + sh.ang) * 0.18;
+              sh.mesh.position.set(Math.cos(a) * r, 0.35 + ((sh.hOff + tSec * 0.90) % 1.45), Math.sin(a) * r);
+              sh.mesh.rotation.set(tSec * 4.5, tSec * 5.5, a);
+            }
+            if (progress >= 0.08) {
+              const dRoll = Math.sin(Math.min(1.0, (progress - 0.08) / 0.92) * Math.PI) * 0.058;
+              camera.rotation.z += dRoll;
+            }
+          } else {
+            outroVfxRig.group.visible = false;
+          }
+        }
+
+        if (cinemaComposer) {
+          cinemaComposer.render(scene, camera, camFocusDist);
+        } else {
+          renderer.render(scene, camera);
+        }
+
+        // If HUD mode or Cliffhanger VFX active, composite onto outCanvas
+        let targetCanvas = renderer.domElement;
+        if ((sceneSpec.hud_mode && sceneSpec.hud_mode !== 'none') || sceneSpec.is_cliffhanger_finale) {
+          outCtx.clearRect(0, 0, W, H);
+          outCtx.drawImage(renderer.domElement, 0, 0);
+          outCtx.save();
+          outCtx.scale(W / 720, H / 1280);
+          drawHudOverlay(outCtx, sceneSpec.hud_mode, progress, tSec, sceneSpec);
+          outCtx.restore();
+          targetCanvas = outCanvas;
+        }
+
+        const blob = await new Promise((r) => targetCanvas.toBlob(r, 'image/png'));
+        await postFrameWithRetry(f, blob);
+      }
+
+      if (cinemaComposer) cinemaComposer.dispose();
+      await fetch('/done', { method: 'POST' });
+    };
+
+    (async () => {
+      try {
+        const res = await fetch('/payload.json');
+        const payload = await res.json();
+        await window.renderScenePayload(payload);
+      } catch (err) {
+        await fetch('/error', { method: 'POST', body: String(err && err.stack || err) });
+      }
+    })();
+  </script>
+</body>
+
+</html>
